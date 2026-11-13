@@ -1,0 +1,22 @@
+# Reference project research
+
+Research was performed against source files, extension configuration, and implementation directories where the GitHub connector exposed them. No third-party source code was copied into this project; it uses only Python's standard library.
+
+| Project | Source inspected and useful pattern | Design impact here |
+|---|---|---|
+| [Claude-Mem](https://github.com/thedotmack/claude-mem) | `ContextBudget.ts` measures rendered output and drops whole context items in a defined order; `ObservationCompiler.ts` composes project-keyed session observations. | Use a measured serialized character budget and prioritize current tasks/checkpoint before lower-priority context. This core does not include Claude-Mem's model summarization or embeddings. |
+| [Claude Context Manager](https://github.com/mrlesmithjr/claude-context-manager) | `docs/ARCHITECTURE.md` and `src/storage/sqlite.ts` show short-lived lifecycle hooks using local SQLite, WAL concurrency, foreign keys, and transactions. | Use a local SQLite file, transactions, WAL, isolated project roots, and thin lifecycle hooks rather than a required background service. |
+| [Context Task Planning](https://github.com/excitedhaha/context-task-planning) | `skill/SKILL.md` uses durable structured state plus aligned plan, findings, and progress files; workflow skills recover work after resets. | Keep an explicit development checklist and task history as operational state. This project stores task state transactionally in SQLite instead of maintaining several synchronized Markdown files. |
+| [Beads](https://github.com/steveyegge/beads) | The connector followed the repository move but rejected the moved repository API endpoint, so source-level inspection could not be completed through the available connector. | No Beads implementation is claimed or copied. Dependency-aware task links are included as a basic native feature. |
+| [Task Master](https://github.com/eyaltoledano/claude-task-master) | Inspected the `tm-core` modules for tasks, dependencies, workflow, storage, and execution, plus the package boundaries for its Claude integration and bridge. | Adopt explicit task/dependency primitives and a thin shared core with host adapters. Model-driven decomposition and workflow orchestration remain out of scope for this initial core. |
+| [Plandex](https://github.com/plandex-ai/plandex) | Inspected `app/server/hooks/hooks.go` and the Go server tree. Its hooks are application/server lifecycle callbacks within a larger planning and execution service. | Do not bring in a server framework for a local companion. Keep this implementation installable as a small local CLI/MCP process. |
+| [Serena](https://github.com/oraios/serena) | Inspected the symbol/LSP architecture (`src/serena/lsp`, `symbol.py`, MCP entry points) and `memories/memory_manager.py`, which writes project memory files atomically and maintains references. | Keep retrieval project-scoped and expose MCP tools so a host can request relevant state. The current lexical task search does not provide Serena's symbol-aware navigation or reference integrity. |
+| [Freebuff](https://github.com/CodebuffAI/freebuff) | Inspected `AgentDefinition` and `MCPConfig` types, custom agent instructions, context-pruner/history compaction code, and its agent/MCP extension layout. The `instructionsPrompt` is inserted after user input and definitions can launch stdio MCP servers. | Provide a Freebuff custom-agent example that invokes this MCP server on each turn. Freebuff does not provide general third-party lifecycle interception, so this is opt-in by agent selection. |
+
+## Limits identified
+
+Host hooks trigger storage, but they do not perform full semantic extraction by themselves. The current deterministic capture splits text into candidate clauses; a model must reconcile intent, changes, and cancellations through MCP or the host instructions. Retrieval is lexical and character-bounded, not vector-search or actual token-budget aware. Codex plugin-directory submissions cannot include lifecycle hooks, Cursor's `beforeSubmitPrompt` cannot inject context, and Freebuff requires the custom agent or SDK wrapper to be selected.
+
+## Licenses and attribution
+
+This implementation contains no copied reference-project code. It adapts public architectural ideas only. The reference projects remain under their respective licenses; users should consult each upstream repository before reusing any of its code.

@@ -102,6 +102,93 @@ class StoreTests(unittest.TestCase):
         self.assertNotIn(b"supersecretvalue123456", raw)
         self.assertTrue(self.store.list_tasks())
 
+    def test_quoted_multiline_secret_is_never_persisted(self):
+        self.store.sync_requirements('Set password="correct horse battery staple"')
+        raw = self.db.read_bytes()
+        for word in (b"correct", b"horse", b"battery", b"staple"):
+            self.assertNotIn(word, raw)
+
+    def test_manual_acceptance_criteria_are_redacted(self):
+        self.store.add_task("Configure authentication", acceptance=['password="another private phrase"'])
+        raw = self.db.read_bytes()
+        for word in (b"another", b"private", b"phrase"):
+            self.assertNotIn(word, raw)
+
+    def test_prefixed_environment_secrets_are_redacted(self):
+        self.store.sync_requirements('Add service config. OPENAI_API_KEY="openai private value". DB_PASSWORD=db-private-value')
+        raw = self.db.read_bytes()
+        for value in (b"openai", b"private", b"value", b"db-private-value"):
+            self.assertNotIn(value, raw)
+
+    def test_ambiguous_cancel_and_change_preserve_tasks(self):
+        self.store.sync_requirements("Add email recovery. Add sms recovery.")
+        before = {task["id"]: task["description"] for task in self.store.list_tasks()}
+        cancelled = self.store.sync_requirements("Cancel recovery")
+        changed = self.store.sync_requirements("Change recovery to passkey recovery")
+        self.assertEqual(cancelled["ambiguous"], ["Cancel recovery"])
+        self.assertEqual(changed["ambiguous"], ["Change recovery to passkey recovery"])
+        after = {task["id"]: task["description"] for task in self.store.list_tasks()}
+        self.assertEqual(after, before)
+
+    def test_changed_requirement_merges_existing_destination(self):
+        self.store.sync_requirements("Add old email recovery. Add passkey recovery.")
+        result = self.store.sync_requirements("Change old email recovery to passkey recovery")
+        rows = self.store.list_tasks()
+        active = [task for task in rows if task["status"] != "cancelled"]
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0]["description"], "Add passkey recovery")
+        self.assertEqual(result["updated"], [active[0]["id"]])
+
+    def test_duplicate_task_merges_new_acceptance_criteria(self):
+        task_id, created = self.store.add_task("Implement account recovery", acceptance=["Email is sent"])
+        duplicate_id, duplicate_created = self.store.add_task("Build account recovery", acceptance=["Token expires", "Email is sent"])
+        self.assertEqual(task_id, duplicate_id)
+        self.assertTrue(created)
+        self.assertFalse(duplicate_created)
+        task = self.store.list_tasks()[0]
+        self.assertEqual(json.loads(task["acceptance"]), ["Email is sent", "Token expires"])
+
+    def test_invalid_mcp_json_does_not_reuse_previous_request_id(self):
+        from context_manager.mcp_server import main as mcp_main
+        output = io.StringIO()
+        requests = '{"jsonrpc":"2.0","id":7,"method":"initialize","params":{}}\nnot-json\n'
+        with patch("sys.stdin", io.StringIO(requests)), redirect_stdout(output):
+            mcp_main()
+        responses = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(responses[0]["id"], 7)
+        self.assertIsNone(responses[1]["id"])
+        self.assertEqual(responses[1]["error"]["code"], -32700)
+
+    def test_mcp_invalid_request_and_unknown_method_get_responses(self):
+        from context_manager.mcp_server import main as mcp_main
+        output = io.StringIO()
+        requests = '[]\n{"jsonrpc":"2.0","id":9,"method":"unknown/method"}\n'
+        with patch("sys.stdin", io.StringIO(requests)), redirect_stdout(output):
+            mcp_main()
+        responses = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(responses[0]["error"]["code"], -32600)
+        self.assertEqual(responses[1]["id"], 9)
+        self.assertEqual(responses[1]["error"]["code"], -32601)
+
+    def test_mcp_tool_errors_are_returned_as_recoverable_tool_results(self):
+        from context_manager.mcp_server import main as mcp_main
+        output = io.StringIO()
+        request = {"jsonrpc": "2.0", "id": 10, "method": "tools/call", "params": {"name": "missing_tool", "arguments": {}}}
+        with patch("sys.stdin", io.StringIO(json.dumps(request) + "\n")), redirect_stdout(output):
+            mcp_main()
+        response = json.loads(output.getvalue())
+        self.assertEqual(response["id"], 10)
+        self.assertTrue(response["result"]["isError"])
+
+    def test_mcp_tool_notification_does_not_execute_mutation(self):
+        from context_manager.mcp_server import main as mcp_main
+        output = io.StringIO()
+        request = {"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "sync_requirements", "arguments": {"text": "Must not persist"}}}
+        with patch("sys.stdin", io.StringIO(json.dumps(request) + "\n")), patch.dict(os.environ, {"CWM_DB_PATH": str(self.db)}), redirect_stdout(output):
+            mcp_main()
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(self.store.list_tasks(), [])
+
     def test_capture_can_be_disabled(self):
         with patch.dict(os.environ, {"CWM_DISABLE_CAPTURE": "1"}):
             result = self.store.sync_requirements("Never store this requirement")
@@ -137,6 +224,25 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(code, 0)
         result = json.loads(output.getvalue())
         self.assertEqual(set(result), {"user_message"})
+
+    def test_claude_precompact_emits_compaction_instructions_as_text(self):
+        from context_manager.cli import main
+        self.store.sync_requirements("Keep the project recovery checklist.")
+        output = io.StringIO()
+        with patch("sys.stdin", io.StringIO('{"trigger":"auto"}')), redirect_stdout(output):
+            code = main(["--root", self.temp.name, "hook", "--host", "claude", "--event", "PreCompact"])
+        self.assertEqual(code, 0)
+        self.assertIn("Persistent project checklist", output.getvalue())
+        self.assertIn("Keep the project recovery checklist", output.getvalue())
+
+    def test_codex_precompact_only_persists_checkpoint(self):
+        from context_manager.cli import main
+        output = io.StringIO()
+        with patch("sys.stdin", io.StringIO('{"trigger":"auto"}')), redirect_stdout(output):
+            code = main(["--root", self.temp.name, "hook", "--host", "codex", "--event", "PreCompact"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output.getvalue()), {})
+        self.assertIsNotNone(self.store.recover()["checkpoint"])
 
     def test_e2e_new_requirement_context_reset_and_recovery(self):
         self.store.sync_requirements("Implement a task checklist. Add reliable checkpoint recovery.")

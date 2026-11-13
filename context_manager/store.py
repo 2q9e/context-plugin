@@ -36,7 +36,7 @@ def split_requirements(text: str) -> list[str]:
 _SECRET_PATTERNS = [
     re.compile(r"(?i)\b(authorization\s*:\s*bearer)\s+[^\s,;]+"),
     re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]{12,}"),
-    re.compile(r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)\s*([=:])\s*(['\"]?)[^\s,;'\"]+"),
+    re.compile(r"(?i)\b((?:[a-z0-9]+[_-])*(?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|auth[_-]?(?:token|key)|client[_-]?secret|private[_-]?key|secret(?:[_-]?access[_-]?key|[_-]?key)?|password|passwd|token|credential|database[_-]?url|db[_-]?url|connection[_-]?string|cookie|session[_-]?(?:id|token|key)))\s*([=:])\s*(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,;]+)"),
     re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
@@ -112,12 +112,25 @@ class Store:
             raise KeyError(f"Unknown parent task: {parent_id}")
         description = scrub(description)
         key = normalize(description)
-        existing = self.db.execute("SELECT id FROM tasks WHERE normalized=? AND status!='cancelled'", (key,)).fetchone()
+        criteria: list[str] = []
+        for criterion in acceptance:
+            if not isinstance(criterion, str) or not criterion.strip():
+                raise ValueError("Acceptance criteria must be non-empty strings")
+            clean = scrub(criterion.strip())
+            if normalize(clean) not in {normalize(x) for x in criteria}:
+                criteria.append(clean)
+        existing = self.db.execute("SELECT id,acceptance FROM tasks WHERE normalized=? AND status!='cancelled'", (key,)).fetchone()
         if existing:
+            existing_criteria = json.loads(existing["acceptance"])
+            known_criteria = {normalize(x) for x in existing_criteria}
+            merged = existing_criteria + [criterion for criterion in criteria if normalize(criterion) not in known_criteria]
+            if merged != existing_criteria:
+                self.db.execute("UPDATE tasks SET acceptance=?,updated_at=? WHERE id=?", (json.dumps(merged), now(), existing["id"]))
+                self._event(existing["id"], "acceptance_updated", json.dumps(merged))
             return str(existing["id"]), False
         task_id, timestamp = uuid.uuid4().hex[:12], now()
         self.db.execute("INSERT INTO tasks(id,description,normalized,status,priority,parent_id,acceptance,created_at,updated_at) VALUES(?,?,?,'pending',?,?,?, ?,?)",
-                        (task_id, description, key, max(0, min(priority, 4)), parent_id, json.dumps(list(acceptance)), timestamp, timestamp))
+                        (task_id, description, key, max(0, min(priority, 4)), parent_id, json.dumps(criteria), timestamp, timestamp))
         self._event(task_id, "created", description)
         return task_id, True
 
@@ -127,48 +140,75 @@ class Store:
         unchanged: list[str] = []
         cancelled: list[str] = []
         updated: list[str] = []
+        ambiguous: list[str] = []
         if os.environ.get("CWM_DISABLE_CAPTURE", "").casefold() in {"1", "true", "yes"}:
-            return {"added": [], "unchanged": [], "updated": [], "cancelled": [], "disabled": ["capture disabled by CWM_DISABLE_CAPTURE"]}
+            return {"added": [], "unchanged": [], "updated": [], "cancelled": [], "ambiguous": [], "disabled": ["capture disabled by CWM_DISABLE_CAPTURE"]}
         sanitized = scrub(text)
         sanitized = re.sub(r"(?i)\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret|authorization)\s*[:=]?\s*\[REDACTED\]", "", sanitized)
         sanitized = re.sub(r"\[REDACTED\]", "", sanitized)
         clauses = split_requirements(sanitized)
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            active = self.db.execute("SELECT * FROM tasks WHERE status!='cancelled'").fetchall()
+            def matching_tasks(target_norm: str) -> list[sqlite3.Row]:
+                active = self.db.execute("SELECT * FROM tasks WHERE status!='cancelled'").fetchall()
+                exact = [task for task in active if task["normalized"] == target_norm]
+                if exact:
+                    return exact
+                target_tokens = set(target_norm.split())
+                if not target_tokens:
+                    return []
+                return [task for task in active if target_tokens.issubset(set(task["normalized"].split()))]
             for clause in clauses:
                 norm = normalize(clause)
                 cancel_prefix = r"^(?:(?:we|i)\s+)?(?:no longer need|do not need|don't need|cancel|drop|remove|forget)\b"
                 if re.match(cancel_prefix, clause, re.I):
                     target = re.sub(cancel_prefix + r"\s+(?:the\s+)?", "", clause, flags=re.I)
                     target_norm = normalize(target)
-                    candidates = [t for t in active if t["normalized"] == target_norm or (target_norm and target_norm in t["normalized"])]
-                    if candidates:
+                    candidates = matching_tasks(target_norm)
+                    if len(candidates) == 1:
                         task = candidates[0]
                         self.db.execute("UPDATE tasks SET status='cancelled',updated_at=? WHERE id=?", (now(), task["id"]))
                         self._event(task["id"], "cancelled", clause)
                         cancelled.append(task["id"])
+                    elif len(candidates) > 1:
+                        ambiguous.append(clause)
                     continue
                 if re.match(r"^(?:change|update|replace)\b", clause, re.I):
                     changed = re.match(r"^(?:change|update|replace)\s+(.+?)\s+(?:to|with)\s+(.+)$", clause, re.I)
                     if changed:
                         old_text, new_text = changed.group(1).strip(" ."), changed.group(2).strip(" .")
                         old_norm = normalize(old_text)
-                        candidates = [t for t in active if old_norm and (old_norm in t["normalized"] or t["normalized"] in old_norm)]
+                        candidates = matching_tasks(old_norm)
                     else:
                         candidates = []
-                    if candidates:
+                    if len(candidates) == 1:
                         task = candidates[0]
                         new_description = scrub(new_text)
-                        self.db.execute("UPDATE tasks SET description=?,normalized=?,status='pending',updated_at=? WHERE id=?",
-                                        (new_description, normalize(new_description), now(), task["id"]))
-                        self._event(task["id"], "requirement_changed", f"{task['description']} -> {new_description}")
-                        updated.append(task["id"])
+                        destination = [candidate for candidate in matching_tasks(normalize(new_description)) if candidate["id"] != task["id"]]
+                        if len(destination) == 1:
+                            target_task = destination[0]
+                            self.db.execute("UPDATE tasks SET status='cancelled',updated_at=? WHERE id=?", (now(), task["id"]))
+                            detail = f"Requirement superseded by existing task {target_task['id']}: {new_description}"
+                            self._event(task["id"], "requirement_merged", detail)
+                            self._event(target_task["id"], "requirement_merged", f"Absorbed requirement from task {task['id']}")
+                            cancelled.append(task["id"])
+                            updated.append(target_task["id"])
+                        elif len(destination) > 1:
+                            ambiguous.append(clause)
+                        else:
+                            self.db.execute("UPDATE tasks SET description=?,normalized=?,status='pending',updated_at=? WHERE id=?",
+                                            (new_description, normalize(new_description), now(), task["id"]))
+                            self._event(task["id"], "requirement_changed", f"{task['description']} -> {new_description}")
+                            updated.append(task["id"])
+                        continue
+                    elif len(candidates) > 1:
+                        ambiguous.append(clause)
                         continue
                     else:
                         tid, created = self.add_task(clause, acceptance=["Updated requirement is implemented and verified"])
                     (added if created else unchanged).append(tid)
                     continue
+                active = self.db.execute("SELECT id,normalized FROM tasks WHERE status!='cancelled'").fetchall()
                 if norm in {t["normalized"] for t in active}:
                     unchanged.append(next(t["id"] for t in active if t["normalized"] == norm))
                     continue
@@ -178,7 +218,7 @@ class Store:
         except Exception:
             self.db.execute("ROLLBACK")
             raise
-        return {"added": added, "unchanged": unchanged, "updated": updated, "cancelled": cancelled}
+        return {"added": added, "unchanged": unchanged, "updated": updated, "cancelled": cancelled, "ambiguous": ambiguous}
 
     def list_tasks(self, statuses: Iterable[str] | None = None) -> list[dict[str, Any]]:
         sql, args = "SELECT * FROM tasks", []

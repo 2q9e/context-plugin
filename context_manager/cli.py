@@ -65,8 +65,16 @@ def main(argv: list[str] | None = None) -> int:
                 context = "Persistent project checklist:\n" + "\n".join(f"- [{t['status']}] {t['description']} (id {t['id']})" for t in bundle["tasks"])
                 if bundle["checkpoint"]:
                     context = f"Last checkpoint: {bundle['checkpoint']['summary']}\nNext: {bundle['checkpoint']['next_action']}\n" + context
-                if args.host == "claude":
+                if args.host == "claude" and args.event == "PreCompact":
+                    # Claude Code treats PreCompact stdout as compaction instructions,
+                    # not as the JSON hook response used by other events.
+                    output = context
+                elif args.host == "claude":
                     output = {"hookSpecificOutput": {"hookEventName": args.event, "additionalContext": context}}
+                elif args.host == "codex" and args.event == "PreCompact":
+                    # Codex PreCompact does not accept hook-specific additionalContext.
+                    # The persisted checkpoint is available to SessionStart/recovery.
+                    output = {}
                 elif args.host == "codex":
                     output = {"hookSpecificOutput": {"hookEventName": args.event, "additionalContext": context}}
                 elif args.host == "cursor":
@@ -80,7 +88,7 @@ def main(argv: list[str] | None = None) -> int:
                         output = {}
                 else:
                     output = {"sync": result, "context": context}
-                print(json.dumps(output, ensure_ascii=False))
+                print(output if isinstance(output, str) else json.dumps(output, ensure_ascii=False))
             else:
                 print(json.dumps(result, ensure_ascii=False))
             return 0

@@ -70,7 +70,14 @@ def main(argv: list[str] | None = None) -> int:
                 elif args.host == "codex":
                     output = {"hookSpecificOutput": {"hookEventName": args.event, "additionalContext": context}}
                 elif args.host == "cursor":
-                    output = {"continue": True, "additional_context": context if args.event == "sessionStart" else ""}
+                    if args.event == "sessionStart":
+                        output = {"additional_context": context}
+                    elif args.event == "beforeSubmitPrompt":
+                        output = {"continue": True}
+                    elif args.event == "preCompact":
+                        output = {"user_message": "Project checkpoint saved. Context recovery is available at the next session start."}
+                    else:
+                        output = {}
                 else:
                     output = {"sync": result, "context": context}
                 print(json.dumps(output, ensure_ascii=False))

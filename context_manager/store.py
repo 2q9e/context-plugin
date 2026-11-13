@@ -195,11 +195,19 @@ class Store:
             raise ValueError(f"Invalid status: {status}")
         if status == "completed":
             evidence = scrub(evidence).strip()
-            if not re.search(r"(?i)\b(command|test|check|file|commit|result|verified|output)\s*[:=]", evidence):
-                raise ValueError("Completion evidence must identify a command, test, check, file, commit, result, or output (for example: 'test: pytest passed').")
+            match = re.match(r"(?i)\s*(command|test|check|file|commit|result|verified|output)\s*[:=]\s*(.+)$", evidence)
+            if not match or len(match.group(2).strip()) < 12 or not re.search(r"(?i)\b(passed|succeeded|verified|reviewed|matched|created|updated|committed|found|produced)\b", match.group(2)):
+                raise ValueError("Completion evidence must name a source and result, such as 'test: pytest tests/test_store.py passed'. Evidence is recorded but cannot be independently validated by this tool.")
         row = self.db.execute("SELECT id FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
             raise KeyError(f"Unknown task: {task_id}")
+        if status == "completed":
+            dependencies = json.loads(self.db.execute("SELECT dependencies FROM tasks WHERE id=?", (task_id,)).fetchone()[0])
+            if dependencies:
+                placeholders = ",".join("?" for _ in dependencies)
+                incomplete = [r["id"] for r in self.db.execute(f"SELECT id FROM tasks WHERE id IN ({placeholders}) AND status!='completed'", dependencies)]
+                if incomplete:
+                    raise ValueError("Cannot complete task while dependencies are unfinished: " + ", ".join(incomplete))
         self.db.execute("UPDATE tasks SET status=?,updated_at=? WHERE id=?", (status, now(), task_id))
         if evidence:
             evidence = scrub(evidence)
@@ -270,9 +278,17 @@ class Store:
                 continue
             selected.append(task)
         result = {"checkpoint": cp, "tasks": selected, "omitted_tasks": len(ordered) - len(selected), "character_budget": char_budget}
-        while len(json.dumps(result, ensure_ascii=False)) > char_budget and cp:
-            cp["summary"] = cp["summary"][: max(0, len(cp["summary"]) - 64)]
-            result["checkpoint"] = cp
+        for field in ("summary", "last_action", "next_action"):
+            while cp and len(json.dumps(result, ensure_ascii=False)) > char_budget and cp[field]:
+                cp[field] = cp[field][:max(0, len(cp[field]) - 64)]
+                result["checkpoint"] = cp
+        if len(json.dumps(result, ensure_ascii=False)) > char_budget and cp:
+            cp = None
+            result["checkpoint"] = None
+        while selected and len(json.dumps(result, ensure_ascii=False)) > char_budget:
+            selected.pop()
+            result["tasks"] = selected
+            result["omitted_tasks"] = len(ordered) - len(selected)
         return result
 
     def checkpoint(self, summary: str, last_action: str = "", next_action: str = "") -> str:

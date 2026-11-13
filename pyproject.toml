@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Local-first persistent requirements, tasks, and context recovery for coding agents"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = "MIT"
 authors = [{name = "Context Window Manager contributors"}]
 dependencies = []
 

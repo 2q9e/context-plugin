@@ -67,7 +67,7 @@ For MCP, merge [`integrations/codex/config.toml`](integrations/codex/config.toml
 
 ### Cursor
 
-Merge [`integrations/cursor/hooks.json`](integrations/cursor/hooks.json) into `.cursor/hooks.json` in the project or `~/.cursor/hooks.json`. `beforeSubmitPrompt` captures prompt text, `sessionStart` injects startup context, and `preCompact` checkpoints. Cursor's `beforeSubmitPrompt` response can allow or block submission but does not inject context; startup context is delivered by `sessionStart`, and mid-session retrieval uses the MCP tools or repository instructions. Cloud-agent support differs; project hook configs are used when the agent has a writable environment. See [Cursor hooks](https://cursor.com/docs/hooks).
+Merge [`integrations/cursor/hooks.json`](integrations/cursor/hooks.json) into `.cursor/hooks.json` in the project or `~/.cursor/hooks.json`. `beforeSubmitPrompt` captures prompt text, `sessionStart` can provide startup context, and `preCompact` checkpoints. Cursor's `beforeSubmitPrompt` response can allow or block submission but does not inject context; `sessionStart` is fire-and-forget, so context may arrive after the first response. Mid-session retrieval uses the MCP tools or repository instructions. Cloud-agent support differs; project hook configs are used when the agent has a writable environment. See [Cursor hooks](https://cursor.com/docs/hooks).
 
 For MCP, merge [`integrations/cursor/mcp.json`](integrations/cursor/mcp.json) into `.cursor/mcp.json` or the user MCP configuration.
 

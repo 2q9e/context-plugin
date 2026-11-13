@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "context-window-manager"
+version = "0.1.0"
+description = "Local-first persistent requirements, tasks, and context recovery for coding agents"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Context Window Manager contributors"}]
+dependencies = []
+
+[project.scripts]
+cwm = "context_manager.cli:main"
+cwm-mcp = "context_manager.mcp_server:main"
+
+[tool.setuptools.packages.find]
+include = ["context_manager*"]

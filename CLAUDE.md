@@ -1,0 +1,1 @@
+Read [AGENTS.md](AGENTS.md) for the persistent checklist workflow. The Claude Code hooks capture each submitted prompt and restore the project checklist on session start; still use the Context Window Manager MCP tools to semantically reconcile requirements, record decisions, and verify completion.

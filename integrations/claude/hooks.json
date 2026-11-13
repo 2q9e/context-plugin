@@ -1,0 +1,13 @@
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "cwm hook --host claude --event SessionStart" }] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "cwm hook --host claude --event UserPromptSubmit" }] }
+    ],
+    "PreCompact": [
+      { "hooks": [{ "type": "command", "command": "cwm hook --host claude --event PreCompact" }] }
+    ]
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "cwm hook --host codex --event SessionStart", "statusMessage": "Recovering project context" }] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "cwm hook --host codex --event UserPromptSubmit" }] }
+    ],
+    "PreCompact": [
+      { "hooks": [{ "type": "command", "command": "cwm hook --host codex --event PreCompact" }] }
+    ]
+  }
+}

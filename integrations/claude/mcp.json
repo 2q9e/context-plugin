@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "context-window-manager": {
+      "command": "cwm-mcp",
+      "args": []
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [{ "command": "cwm hook --host cursor --event sessionStart" }],
+    "beforeSubmitPrompt": [{ "command": "cwm hook --host cursor --event beforeSubmitPrompt" }],
+    "preCompact": [{ "command": "cwm hook --host cursor --event preCompact" }]
+  }
+}

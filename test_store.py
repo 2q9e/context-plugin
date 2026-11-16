@@ -71,6 +71,16 @@ class StoreTests(unittest.TestCase):
         self.store.set_status(a, "completed", "test: prerequisite task passed")
         self.store.set_status(b, "completed", "test: dependent task passed")
 
+    def test_cancelled_dependency_no_longer_blocks_completion(self):
+        prerequisite, _ = self.store.add_task("Prepare optional integration")
+        dependent, _ = self.store.add_task("Complete integration")
+        self.store.set_dependencies(dependent, [prerequisite])
+        self.store.set_status(prerequisite, "cancelled")
+        self.store.set_status(dependent, "completed", "test: integration validation passed")
+        row = next(task for task in self.store.list_tasks() if task["id"] == dependent)
+        self.assertEqual(row["status"], "completed")
+        self.assertEqual(json.loads(row["dependencies"]), [prerequisite])
+
     def test_completion_requires_structured_verification(self):
         task, _ = self.store.add_task("Verify persistence")
         with self.assertRaises(ValueError):

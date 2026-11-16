@@ -7,10 +7,10 @@ It cannot increase a model's physical context limit. The core uses a character-b
 ## Features
 
 - Project-isolated SQLite state in `.context-manager/state.sqlite3` with WAL mode, transactions, and foreign keys.
-- Tasks with IDs, statuses, priority, parent, dependencies, acceptance criteria, relevant project files, decisions, verification evidence, and timestamps.
+- Tasks with IDs, statuses, priority, parent, dependencies, acceptance criteria, relevant project files, decisions, verification evidence, and timestamps. A cancelled prerequisite no longer blocks dependent-task completion; its dependency link remains for history.
 - Prompt-clause capture with exact normalized deduplication, append-on-new-requirement behavior, explicit change/cancel reconciliation, and common credential redaction.
 - Session checkpoints and restart recovery, ranked lexical retrieval, and bounded context output.
-- Completion requires a named evidence source and result, such as `test: python -m unittest passed`; evidence is recorded but not independently validated by the tool. Dependencies must be complete first.
+- Completion requires a named evidence source and result, such as `test: python -m unittest passed`; evidence is recorded but not independently validated by the tool. Dependencies must be completed or cancelled first.
 - Dual-era MCP stdio server with modern protocol discovery and legacy initialization, plus examples for Claude Code, Codex, Cursor, and Freebuff.
 - Optional capture opt-out and history retention; active checklist tasks are retained.
 
@@ -38,6 +38,7 @@ The CLI and hooks select the project root from `--root` when provided, then `CWM
 cwm add "Implement OAuth login" --priority 1 --accept "Login succeeds" --accept "Invalid credentials are rejected"
 cwm list
 cwm depends TASK_ID OTHER_TASK_ID
+cwm depends TASK_ID
 cwm decision TASK_ID "Use the existing OAuth library"
 cwm files TASK_ID src/auth.py tests/test_auth.py
 cwm status TASK_ID in_progress
@@ -46,6 +47,8 @@ cwm checkpoint "OAuth flow implemented" --last "Added callback handler" --next "
 cwm context "OAuth callback" --chars 4000
 cwm recover --budget 10
 ```
+
+Dependencies must be completed or cancelled before a dependent task can be completed. Cancelling a prerequisite releases dependent tasks without deleting the recorded dependency link. Run `cwm depends TASK_ID` with no dependency IDs to clear all dependency links from that task.
 
 The automatic `sync` operation stores sanitized prompt clauses as candidate tasks. It is intentionally conservative: it cannot reliably determine which sentences are requirements, decisions, or discussion. The agent should compare each incoming message against existing work and call the MCP `sync_requirements` tool with any semantic additions, revisions, and cancellations it identifies. A changed requirement is reset to pending and has an event entry preserving the previous description.
 

@@ -357,9 +357,12 @@ class Store:
                 dependencies = json.loads(self.db.execute("SELECT dependencies FROM tasks WHERE id=?", (task_id,)).fetchone()[0])
                 if dependencies:
                     placeholders = ",".join("?" for _ in dependencies)
-                    incomplete = [r["id"] for r in self.db.execute(f"SELECT id FROM tasks WHERE id IN ({placeholders}) AND status!='completed'", dependencies)]
+                    incomplete = [r["id"] for r in self.db.execute(
+                        f"SELECT id FROM tasks WHERE id IN ({placeholders}) AND status NOT IN ('completed','cancelled')",
+                        dependencies,
+                    )]
                     if incomplete:
-                        raise ValueError("Cannot complete task while dependencies are unfinished: " + ", ".join(incomplete))
+                        raise ValueError("Cannot complete task while dependencies are unfinished or unresolved: " + ", ".join(incomplete))
             self.db.execute("UPDATE tasks SET status=?,updated_at=? WHERE id=?", (status, now(), task_id))
             if evidence:
                 evidence = scrub(evidence)

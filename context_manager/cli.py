@@ -45,8 +45,13 @@ def main(argv: list[str] | None = None) -> int:
     context.add_argument("query"); context.add_argument("--limit", type=int, default=8); context.add_argument("--chars", type=int, default=6000)
     task = subs.add_parser("add", help="Add one task with optional acceptance criteria")
     task.add_argument("description"); task.add_argument("--priority", type=int, default=2); task.add_argument("--accept", action="append", default=[]); task.add_argument("--parent")
-    deps = subs.add_parser("depends", help="Set dependency task IDs for a task")
-    deps.add_argument("task_id"); deps.add_argument("dependencies", nargs="*")
+    deps = subs.add_parser(
+        "depends",
+        help="Set dependencies; cancelled prerequisites no longer block completion",
+        description="Set dependency task IDs for a task. Cancelled dependencies are treated as resolved. Omit dependency IDs to clear all dependencies.",
+    )
+    deps.add_argument("task_id", help="Task whose dependencies to replace")
+    deps.add_argument("dependencies", nargs="*", help="Dependency task IDs (omit to clear all)")
     decision = subs.add_parser("decision", help="Record a decision on a task")
     decision.add_argument("task_id"); decision.add_argument("text")
     files = subs.add_parser("files", help="Attach project-relative files to a task")

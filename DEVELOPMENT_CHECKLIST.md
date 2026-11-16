@@ -15,6 +15,7 @@ This checklist tracks the repository implementation against the assignment. Each
 - [x] Run the automated suite: 15 tests passed, including the reset/recovery end-to-end simulation.
 - [x] Verify CLI startup, MCP initialization/tool listing, and build a wheel with the standard setuptools backend.
 - [x] Complete independent code audit and resolve the context-budget loop, Cursor preCompact schema, dependency enforcement, and evidence validation findings.
+- [x] Audit and improve transactional task writes, indexed requirement/history lookups, iterative dependency checks, project-relative path filtering, Markdown code-span parsing, and vault link-resolution scans; align CLI/MCP root selection through `CWM_PROJECT_ROOT`; add dual-era MCP discovery/version negotiation. No tests were run for this increment.
 - [x] Commit each implementation increment separately through the GitHub connector and push to `main`.
 - [x] Reconcile the local checkout with the pushed GitHub `main` branch and verify a clean working tree.
 - [x] Review limitations: semantic extraction remains model-assisted; retrieval is lexical; the tool records but does not independently run verification; Beads source was unavailable through the connector.

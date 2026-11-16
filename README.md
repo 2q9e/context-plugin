@@ -11,7 +11,7 @@ It cannot increase a model's physical context limit. The core uses a character-b
 - Prompt-clause capture with exact normalized deduplication, append-on-new-requirement behavior, explicit change/cancel reconciliation, and common credential redaction.
 - Session checkpoints and restart recovery, ranked lexical retrieval, and bounded context output.
 - Completion requires a named evidence source and result, such as `test: python -m unittest passed`; evidence is recorded but not independently validated by the tool. Dependencies must be complete first.
-- MCP stdio server and examples for Claude Code, Codex, Cursor, and Freebuff.
+- Dual-era MCP stdio server with modern protocol discovery and legacy initialization, plus examples for Claude Code, Codex, Cursor, and Freebuff.
 - Optional capture opt-out and history retention; active checklist tasks are retained.
 
 ## Install
@@ -27,6 +27,10 @@ cwm recover
 ```
 
 For development, run `python -m unittest discover -v` from the repository root.
+
+## Project selection
+
+The CLI and hooks select the project root from `--root` when provided, then `CWM_PROJECT_ROOT`, then the process's current working directory. The MCP server uses `CWM_PROJECT_ROOT` or its process's current working directory. `CWM_PROJECT_ROOT` names the project directory itself, not its `.context-manager` subdirectory. For a user-level or global MCP configuration whose process may start outside the active project, set `CWM_PROJECT_ROOT` in that server's environment; project-local configurations can usually rely on the host's working directory.
 
 ## Usage
 

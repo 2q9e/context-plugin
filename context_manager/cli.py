@@ -24,13 +24,13 @@ def _hook_text() -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="cwm", description="Persist agent requirements and recover project context")
-    parser.add_argument("--root", help="Project root; defaults to the current working directory")
+    parser.add_argument("--root", help="Project root; defaults to CWM_PROJECT_ROOT or the current working directory")
     subs = parser.add_subparsers(dest="command", required=True)
     subs.add_parser("init", help="Initialize project-local state")
     sync = subs.add_parser("sync", help="Record requirements from a prompt; reads host hook JSON from stdin when omitted")
     sync.add_argument("text", nargs="?")
     hook = subs.add_parser("hook", help="Host hook: read prompt JSON from stdin, sync it, and print host response")
-    hook.add_argument("--host", choices=["claude", "codex", "cursor", "freebuff"], default="generic")
+    hook.add_argument("--host", choices=["generic", "claude", "codex", "cursor", "freebuff"], default="generic")
     hook.add_argument("--event", default="UserPromptSubmit")
     listing = subs.add_parser("list", help="List saved tasks")
     listing.add_argument("--all", action="store_true")
@@ -81,11 +81,12 @@ def main(argv: list[str] | None = None) -> int:
     cleanup.add_argument("--purge", action="store_true", help="Permanently remove all project state, including notes and tasks")
     cleanup.add_argument("--yes", action="store_true", help="Confirm --purge without an interactive prompt")
     args = parser.parse_args(argv)
+    root = args.root if args.root is not None else os.environ.get("CWM_PROJECT_ROOT")
 
     if args.command == "cleanup":
         if args.yes and not args.purge:
             parser.error("--yes requires --purge")
-        project_root = Path(args.root or os.getcwd()).expanduser().resolve()
+        project_root = Path(root or os.getcwd()).expanduser().resolve()
         if project_root.is_file():
             project_root = project_root.parent
         state_dir = project_root / ".context-manager"
@@ -123,7 +124,7 @@ def main(argv: list[str] | None = None) -> int:
         if not state_dir.is_dir():
             parser.error(f"Project-state path is not a directory: {state_dir}")
 
-    store = project_store(args.root)
+    store = project_store(root)
     try:
         if args.command == "cleanup":
             print(json.dumps(store.cleanup(), ensure_ascii=False))

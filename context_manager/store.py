@@ -6,9 +6,10 @@ import os
 import re
 import sqlite3
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Iterable
+from pathlib import Path, PureWindowsPath
+from typing import Any, Iterable, Iterator
 
 
 def now() -> str:
@@ -57,6 +58,7 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.path, timeout=15, isolation_level=None)
         self.db.row_factory = sqlite3.Row
+        self._savepoint_counter = 0
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA busy_timeout=15000")
@@ -93,8 +95,37 @@ class Store:
         );
         CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS tasks_status_idx ON tasks(status, priority, updated_at);
+        CREATE INDEX IF NOT EXISTS tasks_active_normalized_idx ON tasks(normalized) WHERE status!='cancelled';
         CREATE INDEX IF NOT EXISTS events_task_idx ON events(task_id, id);
+        CREATE INDEX IF NOT EXISTS events_created_at_idx ON events(created_at);
+        CREATE INDEX IF NOT EXISTS checkpoints_created_at_idx ON checkpoints(created_at);
         """)
+
+    @contextmanager
+    def _write_transaction(self) -> Iterator[None]:
+        """Make each multi-statement mutation atomic, including inside sync transactions."""
+        if self.db.in_transaction:
+            self._savepoint_counter += 1
+            savepoint = f"cwm_write_{self._savepoint_counter}"
+            self.db.execute(f"SAVEPOINT {savepoint}")
+            try:
+                yield
+            except BaseException:
+                self.db.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                self.db.execute(f"RELEASE SAVEPOINT {savepoint}")
+                raise
+            else:
+                self.db.execute(f"RELEASE SAVEPOINT {savepoint}")
+            return
+
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+            self.db.execute("COMMIT")
+        except BaseException:
+            if self.db.in_transaction:
+                self.db.execute("ROLLBACK")
+            raise
 
     def _prune_history(self) -> dict[str, int]:
         """Optional retention applies to history only; active requirements remain durable."""
@@ -106,8 +137,9 @@ class Store:
         if days > 0:
             cutoff = datetime.now(timezone.utc).timestamp() - days * 86400
             cutoff_text = datetime.fromtimestamp(cutoff, timezone.utc).isoformat(timespec="seconds")
-            removed["events"] = max(0, self.db.execute("DELETE FROM events WHERE created_at < ?", (cutoff_text,)).rowcount)
-            removed["checkpoints"] = max(0, self.db.execute("DELETE FROM checkpoints WHERE created_at < ?", (cutoff_text,)).rowcount)
+            with self._write_transaction():
+                removed["events"] = max(0, self.db.execute("DELETE FROM events WHERE created_at < ?", (cutoff_text,)).rowcount)
+                removed["checkpoints"] = max(0, self.db.execute("DELETE FROM checkpoints WHERE created_at < ?", (cutoff_text,)).rowcount)
         return removed
 
     def cleanup(self) -> dict[str, Any]:
@@ -155,8 +187,6 @@ class Store:
         description = description.strip()
         if not description:
             raise ValueError("Task description cannot be empty")
-        if parent_id and not self.db.execute("SELECT 1 FROM tasks WHERE id=?", (parent_id,)).fetchone():
-            raise KeyError(f"Unknown parent task: {parent_id}")
         description = scrub(description)
         key = normalize(description)
         criteria: list[str] = []
@@ -166,20 +196,23 @@ class Store:
             clean = scrub(criterion.strip())
             if normalize(clean) not in {normalize(x) for x in criteria}:
                 criteria.append(clean)
-        existing = self.db.execute("SELECT id,acceptance FROM tasks WHERE normalized=? AND status!='cancelled'", (key,)).fetchone()
-        if existing:
-            existing_criteria = json.loads(existing["acceptance"])
-            known_criteria = {normalize(x) for x in existing_criteria}
-            merged = existing_criteria + [criterion for criterion in criteria if normalize(criterion) not in known_criteria]
-            if merged != existing_criteria:
-                self.db.execute("UPDATE tasks SET acceptance=?,updated_at=? WHERE id=?", (json.dumps(merged), now(), existing["id"]))
-                self._event(existing["id"], "acceptance_updated", json.dumps(merged))
-            return str(existing["id"]), False
-        task_id, timestamp = uuid.uuid4().hex[:12], now()
-        self.db.execute("INSERT INTO tasks(id,description,normalized,status,priority,parent_id,acceptance,created_at,updated_at) VALUES(?,?,?,'pending',?,?,?, ?,?)",
-                        (task_id, description, key, max(0, min(priority, 4)), parent_id, json.dumps(criteria), timestamp, timestamp))
-        self._event(task_id, "created", description)
-        return task_id, True
+        with self._write_transaction():
+            if parent_id and not self.db.execute("SELECT 1 FROM tasks WHERE id=?", (parent_id,)).fetchone():
+                raise KeyError(f"Unknown parent task: {parent_id}")
+            existing = self.db.execute("SELECT id,acceptance FROM tasks WHERE normalized=? AND status!='cancelled'", (key,)).fetchone()
+            if existing:
+                existing_criteria = json.loads(existing["acceptance"])
+                known_criteria = {normalize(x) for x in existing_criteria}
+                merged = existing_criteria + [criterion for criterion in criteria if normalize(criterion) not in known_criteria]
+                if merged != existing_criteria:
+                    self.db.execute("UPDATE tasks SET acceptance=?,updated_at=? WHERE id=?", (json.dumps(merged), now(), existing["id"]))
+                    self._event(existing["id"], "acceptance_updated", json.dumps(merged))
+                return str(existing["id"]), False
+            task_id, timestamp = uuid.uuid4().hex[:12], now()
+            self.db.execute("INSERT INTO tasks(id,description,normalized,status,priority,parent_id,acceptance,created_at,updated_at) VALUES(?,?,?,'pending',?,?,?, ?,?)",
+                            (task_id, description, key, max(0, min(priority, 4)), parent_id, json.dumps(criteria), timestamp, timestamp))
+            self._event(task_id, "created", description)
+            return task_id, True
 
     def sync_requirements(self, text: str) -> dict[str, list[str]]:
         """Append new requirements; preserve existing tasks and reconcile explicit changes/cancellations."""
@@ -197,13 +230,13 @@ class Store:
         self.db.execute("BEGIN IMMEDIATE")
         try:
             def matching_tasks(target_norm: str) -> list[sqlite3.Row]:
-                active = self.db.execute("SELECT * FROM tasks WHERE status!='cancelled'").fetchall()
-                exact = [task for task in active if task["normalized"] == target_norm]
+                exact = self.db.execute("SELECT * FROM tasks WHERE normalized=? AND status!='cancelled'", (target_norm,)).fetchall()
                 if exact:
                     return exact
                 target_tokens = set(target_norm.split())
                 if not target_tokens:
                     return []
+                active = self.db.execute("SELECT * FROM tasks WHERE status!='cancelled'").fetchall()
                 return [task for task in active if target_tokens.issubset(set(task["normalized"].split()))]
             for clause in clauses:
                 norm = normalize(clause)
@@ -255,9 +288,9 @@ class Store:
                         tid, created = self.add_task(clause, acceptance=["Updated requirement is implemented and verified"])
                     (added if created else unchanged).append(tid)
                     continue
-                active = self.db.execute("SELECT id,normalized FROM tasks WHERE status!='cancelled'").fetchall()
-                if norm in {t["normalized"] for t in active}:
-                    unchanged.append(next(t["id"] for t in active if t["normalized"] == norm))
+                existing = self.db.execute("SELECT id FROM tasks WHERE normalized=? AND status!='cancelled'", (norm,)).fetchone()
+                if existing:
+                    unchanged.append(str(existing["id"]))
                     continue
                 tid, created = self.add_task(clause, acceptance=["Requirement is implemented and evidence recorded"])
                 (added if created else unchanged).append(tid)
@@ -285,64 +318,82 @@ class Store:
             match = re.match(r"(?i)\s*(command|test|check|file|commit|result|verified|output)\s*[:=]\s*(.+)$", evidence)
             if not match or len(match.group(2).strip()) < 12 or not re.search(r"(?i)\b(passed|succeeded|verified|reviewed|matched|created|updated|committed|found|produced)\b", match.group(2)):
                 raise ValueError("Completion evidence must name a source and result, such as 'test: pytest tests/test_store.py passed'. Evidence is recorded but cannot be independently validated by this tool.")
-        row = self.db.execute("SELECT id FROM tasks WHERE id=?", (task_id,)).fetchone()
-        if not row:
-            raise KeyError(f"Unknown task: {task_id}")
-        if status == "completed":
-            dependencies = json.loads(self.db.execute("SELECT dependencies FROM tasks WHERE id=?", (task_id,)).fetchone()[0])
-            if dependencies:
-                placeholders = ",".join("?" for _ in dependencies)
-                incomplete = [r["id"] for r in self.db.execute(f"SELECT id FROM tasks WHERE id IN ({placeholders}) AND status!='completed'", dependencies)]
-                if incomplete:
-                    raise ValueError("Cannot complete task while dependencies are unfinished: " + ", ".join(incomplete))
-        self.db.execute("UPDATE tasks SET status=?,updated_at=? WHERE id=?", (status, now(), task_id))
-        if evidence:
-            evidence = scrub(evidence)
-            old = self.db.execute("SELECT verification FROM tasks WHERE id=?", (task_id,)).fetchone()[0]
-            values = json.loads(old); values.append({"evidence": evidence, "at": now()})
-            self.db.execute("UPDATE tasks SET verification=? WHERE id=?", (json.dumps(values), task_id))
-        self._event(task_id, status, evidence or status)
+        with self._write_transaction():
+            row = self.db.execute("SELECT id FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if not row:
+                raise KeyError(f"Unknown task: {task_id}")
+            if status == "completed":
+                dependencies = json.loads(self.db.execute("SELECT dependencies FROM tasks WHERE id=?", (task_id,)).fetchone()[0])
+                if dependencies:
+                    placeholders = ",".join("?" for _ in dependencies)
+                    incomplete = [r["id"] for r in self.db.execute(f"SELECT id FROM tasks WHERE id IN ({placeholders}) AND status!='completed'", dependencies)]
+                    if incomplete:
+                        raise ValueError("Cannot complete task while dependencies are unfinished: " + ", ".join(incomplete))
+            self.db.execute("UPDATE tasks SET status=?,updated_at=? WHERE id=?", (status, now(), task_id))
+            if evidence:
+                evidence = scrub(evidence)
+                old = self.db.execute("SELECT verification FROM tasks WHERE id=?", (task_id,)).fetchone()[0]
+                values = json.loads(old); values.append({"evidence": evidence, "at": now()})
+                self.db.execute("UPDATE tasks SET verification=? WHERE id=?", (json.dumps(values), task_id))
+            self._event(task_id, status, evidence or status)
 
     def set_dependencies(self, task_id: str, dependencies: Iterable[str]) -> None:
-        if not self.db.execute("SELECT 1 FROM tasks WHERE id=?", (task_id,)).fetchone():
-            raise KeyError(f"Unknown task: {task_id}")
         deps = list(dict.fromkeys(dependencies))
         if task_id in deps:
             raise ValueError("A task cannot depend on itself")
-        known = {row[0] for row in self.db.execute("SELECT id FROM tasks")}
-        if any(dep not in known for dep in deps):
-            raise KeyError("Every dependency must be an existing task ID")
-        graph = {row[0]: set(json.loads(row[1])) for row in self.db.execute("SELECT id,dependencies FROM tasks")}
-        graph[task_id] = set(deps)
-        def reaches(start: str, target: str, seen: set[str]) -> bool:
-            if start == target:
-                return True
-            if start in seen:
+        with self._write_transaction():
+            if not self.db.execute("SELECT 1 FROM tasks WHERE id=?", (task_id,)).fetchone():
+                raise KeyError(f"Unknown task: {task_id}")
+            known = {row[0] for row in self.db.execute("SELECT id FROM tasks")}
+            if any(dep not in known for dep in deps):
+                raise KeyError("Every dependency must be an existing task ID")
+            graph = {row[0]: set(json.loads(row[1])) for row in self.db.execute("SELECT id,dependencies FROM tasks")}
+            graph[task_id] = set(deps)
+            def reaches(start: str, target: str) -> bool:
+                pending = [start]
+                seen: set[str] = set()
+                while pending:
+                    current = pending.pop()
+                    if current == target:
+                        return True
+                    if current not in seen:
+                        seen.add(current)
+                        pending.extend(graph.get(current, ()))
                 return False
-            seen.add(start)
-            return any(reaches(child, target, seen) for child in graph.get(start, ()))
-        for dep in deps:
-            if reaches(dep, task_id, set()):
-                raise ValueError("Dependency would create a cycle")
-        self.db.execute("UPDATE tasks SET dependencies=?,updated_at=? WHERE id=?", (json.dumps(deps), now(), task_id))
-        self._event(task_id, "dependencies", json.dumps(deps))
+            for dep in deps:
+                if reaches(dep, task_id):
+                    raise ValueError("Dependency would create a cycle")
+            self.db.execute("UPDATE tasks SET dependencies=?,updated_at=? WHERE id=?", (json.dumps(deps), now(), task_id))
+            self._event(task_id, "dependencies", json.dumps(deps))
 
     def add_decision(self, task_id: str, decision: str) -> None:
-        row = self.db.execute("SELECT decisions FROM tasks WHERE id=?", (task_id,)).fetchone()
-        if not row:
-            raise KeyError(f"Unknown task: {task_id}")
         decision = scrub(decision)
-        values = json.loads(row[0]); values.append({"decision": decision, "at": now()})
-        self.db.execute("UPDATE tasks SET decisions=?,updated_at=? WHERE id=?", (json.dumps(values), now(), task_id))
-        self._event(task_id, "decision", decision)
+        with self._write_transaction():
+            row = self.db.execute("SELECT decisions FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if not row:
+                raise KeyError(f"Unknown task: {task_id}")
+            values = json.loads(row[0]); values.append({"decision": decision, "at": now()})
+            self.db.execute("UPDATE tasks SET decisions=?,updated_at=? WHERE id=?", (json.dumps(values), now(), task_id))
+            self._event(task_id, "decision", decision)
 
     def add_relevant_files(self, task_id: str, paths: Iterable[str]) -> None:
-        row = self.db.execute("SELECT relevant_files FROM tasks WHERE id=?", (task_id,)).fetchone()
-        if not row:
-            raise KeyError(f"Unknown task: {task_id}")
         # Keep only project-relative paths to prevent unrelated local paths entering memory.
-        values = list(dict.fromkeys(json.loads(row[0]) + [p for p in paths if p and not Path(p).is_absolute() and ".." not in Path(p).parts]))
-        self.db.execute("UPDATE tasks SET relevant_files=?,updated_at=? WHERE id=?", (json.dumps(values), now(), task_id))
+        safe_paths = []
+        for path in paths:
+            if not path:
+                continue
+            local_path = Path(path)
+            windows_path = PureWindowsPath(path)
+            if (local_path.is_absolute() or windows_path.is_absolute() or windows_path.drive or windows_path.root
+                    or ".." in local_path.parts or ".." in windows_path.parts):
+                continue
+            safe_paths.append(path)
+        with self._write_transaction():
+            row = self.db.execute("SELECT relevant_files FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if not row:
+                raise KeyError(f"Unknown task: {task_id}")
+            values = list(dict.fromkeys(json.loads(row[0]) + safe_paths))
+            self.db.execute("UPDATE tasks SET relevant_files=?,updated_at=? WHERE id=?", (json.dumps(values), now(), task_id))
 
     def context_bundle(self, query: str, char_budget: int = 6000) -> dict[str, Any]:
         """Return a small prioritized recovery bundle bounded by rendered characters."""
@@ -430,6 +481,7 @@ class Store:
                 "recent_notes": ProjectVault(self.path.parent / "vault").recent_notes(limit=3)}
 
     def search(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
+        limit = max(0, limit)
         terms = [x for x in normalize(query).split() if len(x) > 1]
         rows = self.db.execute("SELECT id,description,status,priority,updated_at FROM tasks WHERE status!='cancelled'").fetchall()
         scored = []
@@ -438,11 +490,12 @@ class Store:
             score = sum(1 for term in terms if term in tokens)
             if score:
                 scored.append((score, dict(row)))
-        return [item for _, item in sorted(scored, key=lambda x: (-x[0], x[1]["priority"]))[:limit]]
+        return [item for _, item in sorted(scored, key=lambda x: (-x[0], x[1]["priority"], x[1]["id"]))[:limit]]
 
 
 def project_store(root: str | Path | None = None) -> Store:
-    root_path = Path(root or os.getcwd()).expanduser().resolve()
+    configured_root = root if root is not None else os.environ.get("CWM_PROJECT_ROOT")
+    root_path = Path(configured_root or os.getcwd()).expanduser().resolve()
     if root_path.is_file():
         root_path = root_path.parent
     return Store(root_path / ".context-manager" / "state.sqlite3")

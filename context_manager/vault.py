@@ -86,8 +86,34 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str, str | None]:
 
 def _link_text(text: str) -> str:
     """Return wiki links outside fenced and inline code."""
-    text = re.sub(r"(?ms)^\s*(```|~~~).*?^\s*\1\s*$", "", text)
-    return re.sub(r"`[^`\n]*`", "", text)
+    visible: list[str] = []
+    fence_char: str | None = None
+    fence_length = 0
+    for line in text.splitlines(keepends=True):
+        newline = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+        if fence_char:
+            closing = re.match(rf"^ {{0,3}}{re.escape(fence_char)}{{{fence_length},}}[ \t]*(?:\r?\n)?$", line)
+            if closing:
+                fence_char = None
+                fence_length = 0
+            visible.append(newline)
+            continue
+
+        opening = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+        if opening:
+            marker = opening.group(1)
+            # CommonMark forbids backticks in the info string of a backtick fence.
+            if marker[0] == "`" and "`" in line[opening.end():]:
+                visible.append(line)
+                continue
+            fence_char = marker[0]
+            fence_length = len(marker)
+            visible.append(newline)
+            continue
+        visible.append(line)
+
+    text = "".join(visible)
+    return re.sub(r"(?<!`)(?P<ticks>`+)(?!`).*?(?<!`)(?P=ticks)(?!`)", "", text, flags=re.S)
 
 
 def _link_target(value: str) -> str:
@@ -209,16 +235,46 @@ class ProjectVault:
             str(doc["title"]).casefold().strip(),
         }
 
-    def _resolve(self, reference: str) -> dict[str, Any]:
+    @staticmethod
+    def _key_index(documents: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+        """Index note aliases once when resolving several links in one operation."""
+        by_key: dict[str, list[dict[str, Any]]] = {}
+        for doc in documents:
+            for key in ProjectVault._keys(doc):
+                by_key.setdefault(key, []).append(doc)
+        return by_key
+
+    @staticmethod
+    def _reference_key(reference: str) -> str:
         key = _link_target(reference)
         if not key or key.startswith("."):
             raise ValueError("Note reference must be a note ID, title, or vault-relative path")
-        matches = [doc for doc in self._documents() if key in self._keys(doc)]
+        return key
+
+    @staticmethod
+    def _resolve_candidates(reference: str, matches: list[dict[str, Any]]) -> dict[str, Any]:
         if not matches:
             raise KeyError(f"Unknown note: {reference}")
         if len(matches) > 1:
             raise ValueError(f"Ambiguous note reference: {reference}; use a note ID or full vault-relative path")
         return matches[0]
+
+    @staticmethod
+    def _resolve_from_index(reference: str, by_key: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+        key = ProjectVault._reference_key(reference)
+        return ProjectVault._resolve_candidates(reference, by_key.get(key, []))
+
+    @staticmethod
+    def _resolve_from_documents(reference: str, documents: list[dict[str, Any]]) -> dict[str, Any]:
+        key = ProjectVault._reference_key(reference)
+        matches = [doc for doc in documents if key in ProjectVault._keys(doc)]
+        return ProjectVault._resolve_candidates(reference, matches)
+
+    def _resolve(self, reference: str) -> dict[str, Any]:
+        key = self._reference_key(reference)
+        documents = self._documents()
+        matches = [doc for doc in documents if key in self._keys(doc)]
+        return self._resolve_candidates(reference, matches)
 
     @staticmethod
     def _summary(doc: dict[str, Any]) -> dict[str, Any]:
@@ -275,12 +331,9 @@ class ProjectVault:
         return [item for _, item in scored[:max(0, min(limit, 100))]]
 
     def note_links(self, reference: str) -> list[dict[str, Any]]:
-        doc = self._resolve(reference)
         documents = self._documents()
-        by_key: dict[str, list[dict[str, Any]]] = {}
-        for candidate in documents:
-            for key in self._keys(candidate):
-                by_key.setdefault(key, []).append(candidate)
+        by_key = self._key_index(documents)
+        doc = self._resolve_from_index(reference, by_key)
         result: list[dict[str, Any]] = []
         seen: set[str] = set()
         for raw in _WIKILINK.findall(_link_text(doc["content"])):
@@ -297,10 +350,11 @@ class ProjectVault:
         return result
 
     def backlinks(self, reference: str) -> list[dict[str, Any]]:
-        target = self._resolve(reference)
+        documents = self._documents()
+        target = self._resolve_from_documents(reference, documents)
         target_keys = self._keys(target)
         results = []
-        for source in self._documents():
+        for source in documents:
             if source["id"] == target["id"]:
                 continue
             for raw in _WIKILINK.findall(_link_text(source["content"])):
@@ -413,8 +467,10 @@ class ProjectVault:
         return self._summary(self._resolve(doc["id"]))
 
     def link_notes(self, source: str, target: str) -> dict[str, Any]:
-        source_doc = self._resolve(source)
-        target_doc = self._resolve(target)
+        documents = self._documents()
+        by_key = self._key_index(documents)
+        source_doc = self._resolve_from_index(source, by_key)
+        target_doc = self._resolve_from_index(target, by_key)
         if source_doc["id"] == target_doc["id"]:
             raise ValueError("A note cannot be linked to itself")
         target_path = Path(target_doc["path"]).with_suffix("").as_posix()
@@ -422,7 +478,7 @@ class ProjectVault:
         body = source_doc["content"]
         for raw in _WIKILINK.findall(_link_text(body)):
             try:
-                if self._resolve(raw)["id"] == target_doc["id"]:
+                if self._resolve_from_index(raw, by_key)["id"] == target_doc["id"]:
                     return {"source": self._summary(source_doc), "target": self._summary(target_doc), "created": False}
             except (KeyError, ValueError):
                 continue
@@ -433,5 +489,6 @@ class ProjectVault:
         else:
             body = body.rstrip() + f"\n\n{section}\n\n- {link}\n"
         self._replace_body(source_doc, body)
-        return {"source": self._summary(self._resolve(source_doc["id"])),
-                "target": self._summary(self._resolve(target_doc["id"])), "created": True}
+        updated_by_key = self._key_index(self._documents())
+        return {"source": self._summary(self._resolve_from_index(source_doc["id"], updated_by_key)),
+                "target": self._summary(self._resolve_from_index(target_doc["id"], updated_by_key)), "created": True}

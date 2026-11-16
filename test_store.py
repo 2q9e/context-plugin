@@ -1,6 +1,7 @@
 import json
 import io
 import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -121,6 +122,58 @@ class StoreTests(unittest.TestCase):
         for value in (b"openai", b"private", b"value", b"db-private-value"):
             self.assertNotIn(value, raw)
 
+    def test_pem_private_key_blocks_are_redacted_from_tasks_and_notes(self):
+        from context_manager.vault import ProjectVault
+        private_key = (
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+            "private-key-payload-that-must-not-be-saved-7a31\n"
+            "-----END OPENSSH PRIVATE KEY-----"
+        )
+        self.store.add_task("Keep imported credential\n" + private_key)
+        for database_file in (self.db, Path(f"{self.db}-wal"), Path(f"{self.db}-shm")):
+            if database_file.exists():
+                self.assertNotIn(b"private-key-payload-that-must-not-be-saved-7a31", database_file.read_bytes())
+        vault = ProjectVault(Path(self.temp.name) / ".context-manager" / "vault")
+        note = vault.create_note("Key note", private_key)
+        content = (vault.root / note["path"]).read_bytes()
+        self.assertNotIn(b"private-key-payload-that-must-not-be-saved-7a31", content)
+
+    def test_store_rejects_symlinked_state_directory_and_database(self):
+        state_target = Path(self.temp.name) / "state-target"
+        state_target.mkdir()
+        linked_project = Path(self.temp.name) / "linked-project"
+        linked_project.mkdir()
+        try:
+            (linked_project / ".context-manager").symlink_to(state_target, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("Directory symlinks are unavailable")
+        with self.assertRaises(ValueError):
+            Store(linked_project / ".context-manager" / "state.sqlite3")
+        self.assertEqual(list(state_target.iterdir()), [])
+
+        regular_state = Path(self.temp.name) / "regular-state"
+        regular_state.mkdir()
+        target_db = Path(self.temp.name) / "protected.sqlite3"
+        target_db.write_text("preserve", encoding="utf-8")
+        try:
+            (regular_state / "state.sqlite3").symlink_to(target_db)
+        except (OSError, NotImplementedError):
+            self.skipTest("File symlinks are unavailable")
+        with self.assertRaises(ValueError):
+            Store(regular_state / "state.sqlite3")
+        self.assertEqual(target_db.read_text(encoding="utf-8"), "preserve")
+
+    def test_sqlite_state_and_sidecars_use_private_permissions(self):
+        if os.name != "posix":
+            self.skipTest("POSIX file permissions are unavailable")
+        self.store.add_task("Verify private state permissions")
+        self.assertEqual(stat.S_IMODE(self.db.parent.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(self.db.stat().st_mode), 0o600)
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(f"{self.db}{suffix}")
+            if sidecar.exists():
+                self.assertEqual(stat.S_IMODE(sidecar.stat().st_mode), 0o600)
+
     def test_relevant_file_paths_are_redacted_before_persistence(self):
         task_id, _ = self.store.add_task("Review service configuration")
         secret = "supersecretvalue123456"
@@ -214,6 +267,28 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(output.getvalue(), "")
         self.assertEqual(self.store.list_tasks(), [])
 
+    def test_mcp_add_task_works_when_prompt_capture_is_disabled(self):
+        from context_manager.mcp_server import TOOLS, main as mcp_main
+        self.assertIn("add_task", {tool["name"] for tool in TOOLS})
+        requests = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25"}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "add_task", "arguments": {
+                "description": "Manually curated task", "priority": 1, "acceptance": ["Keep this task"]}}},
+        ]
+        output = io.StringIO()
+        with patch.dict(os.environ, {"CWM_PROJECT_ROOT": self.temp.name, "CWM_DISABLE_CAPTURE": "1"}), patch(
+            "sys.stdin", io.StringIO("".join(json.dumps(item) + "\n" for item in requests))
+        ), redirect_stdout(output):
+            mcp_main()
+        responses = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertFalse(responses[1]["result"].get("isError", False))
+        created = json.loads(responses[1]["result"]["content"][0]["text"])
+        self.assertTrue(created["created"])
+        task = self.store.list_tasks()[0]
+        self.assertEqual(task["description"], "Manually curated task")
+        self.assertEqual(task["priority"], 1)
+        self.assertEqual(json.loads(task["acceptance"]), ["Keep this task"])
+
     def test_capture_can_be_disabled(self):
         with patch.dict(os.environ, {"CWM_DISABLE_CAPTURE": "1"}):
             result = self.store.sync_requirements("Never store this requirement")
@@ -249,6 +324,21 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(code, 0)
         result = json.loads(output.getvalue())
         self.assertEqual(set(result), {"user_message"})
+        self.assertIn("recovery context", result["user_message"])
+
+    def test_precompact_preserves_existing_detailed_checkpoint(self):
+        from context_manager.cli import main
+        self.store.checkpoint("Detailed progress", "Implemented token refresh", "Verify expired-token handling")
+        output = io.StringIO()
+        with patch("sys.stdin", io.StringIO('{"trigger":"auto"}')), redirect_stdout(output):
+            code = main(["--root", self.temp.name, "hook", "--host", "codex", "--event", "PreCompact"])
+        self.assertEqual(code, 0)
+        checkpoint = self.store.recover()["checkpoint"]
+        self.assertEqual(checkpoint["summary"], "Detailed progress")
+        self.assertEqual(checkpoint["last_action"], "Implemented token refresh")
+        self.assertEqual(checkpoint["next_action"], "Verify expired-token handling")
+        bundle = self.store.context_bundle("", 6000)
+        self.assertEqual(bundle["checkpoint"]["summary"], "Detailed progress")
 
     def test_claude_precompact_emits_compaction_instructions_as_text(self):
         from context_manager.cli import main
@@ -267,7 +357,9 @@ class StoreTests(unittest.TestCase):
             code = main(["--root", self.temp.name, "hook", "--host", "codex", "--event", "PreCompact"])
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(output.getvalue()), {})
-        self.assertIsNotNone(self.store.recover()["checkpoint"])
+        checkpoint = self.store.recover()["checkpoint"]
+        self.assertEqual(checkpoint["summary"], "Automatic pre-compaction recovery marker")
+        self.assertEqual(checkpoint["last_action"], "")
 
     def test_e2e_new_requirement_context_reset_and_recovery(self):
         self.store.sync_requirements("Implement a task checklist. Add reliable checkpoint recovery.")
@@ -330,6 +422,46 @@ class ProjectVaultTests(unittest.TestCase):
         self.assertEqual(len(self.vault.search_notes("tag:#json")), 1)
         self.assertEqual(self.vault.search_notes("[source:null]"), [])
         self.assertEqual(self.vault.search_notes("[source]"), [])
+
+    def test_editing_json_frontmatter_preserves_json_properties(self):
+        self.vault.root.mkdir(parents=True)
+        source_path = self.vault.root / "json-source.md"
+        source_path.write_text(
+            '---\n{"id":"json-source","title":"JSON source","aliases":["JSON source alias"],'
+            '"tags":["human"],"source":{"url":"https://example.com"}}\n---\n\nExisting body.\n',
+            encoding="utf-8",
+        )
+        target = self.vault.create_note("JSON target")
+        self.vault.append_note("JSON source alias", "New detail.")
+        linked = self.vault.link_notes("JSON source alias", target["id"])
+        self.assertTrue(linked["created"])
+        raw = source_path.read_text(encoding="utf-8")
+        header = raw.split("---\n", 2)[1].split("\n---", 1)[0]
+        properties = json.loads(header)
+        self.assertEqual(properties["title"], "JSON source")
+        self.assertEqual(properties["aliases"], ["JSON source alias"])
+        self.assertEqual(properties["tags"], ["human"])
+        self.assertEqual(properties["source"], {"url": "https://example.com"})
+        self.assertIsInstance(properties["updated"], str)
+        self.assertIn("New detail.", raw)
+        self.assertIn(f"[[{target['path'][:-3]}]]", raw)
+
+    def test_link_notes_ignores_prose_and_code_when_finding_related_heading(self):
+        source = self.vault.create_note(
+            "Related source",
+            "This sentence mentions ## Related notes in prose.\n\n"
+            "```md\n## Related notes\n- example\n```\n\n"
+            "## Related notes\nExisting prose directly after the heading.\n",
+        )
+        target = self.vault.create_note("Related target")
+        result = self.vault.link_notes(source["id"], target["id"])
+        self.assertTrue(result["created"])
+        body = self.vault.read_note(source["id"])["content"]
+        self.assertIn("This sentence mentions ## Related notes in prose.", body)
+        self.assertIn("```md\n## Related notes\n- example\n```", body)
+        self.assertIn("## Related notes\n- [[related-target]]\nExisting prose directly after the heading.", body)
+        outgoing = self.vault.note_links(source["id"])
+        self.assertEqual([item["resolved"]["id"] for item in outgoing], [target["id"]])
 
     def test_titles_and_aliases_with_link_syntax_characters_resolve(self):
         note = self.vault.create_note("C# Setup", aliases=["C# Quickstart", "Title | Alias"])

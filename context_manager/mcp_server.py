@@ -11,6 +11,7 @@ from .vault import ProjectVault
 
 TOOLS = [
     {"name": "sync_requirements", "description": "Append prompt requirements to this project's persistent checklist. Input is captured text; semantic interpretation remains the agent's responsibility.", "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}},
+    {"name": "add_task", "description": "Manually add one task to this project's persistent checklist, even when automatic prompt capture is disabled.", "inputSchema": {"type": "object", "properties": {"description": {"type": "string"}, "priority": {"type": "integer", "minimum": 0, "maximum": 4}, "acceptance": {"type": "array", "items": {"type": "string"}}, "parent_id": {"type": "string"}}, "required": ["description"]}},
     {"name": "list_tasks", "description": "List pending, active, and blocked project tasks.", "inputSchema": {"type": "object", "properties": {}}},
     {"name": "set_task_status", "description": "Update a task. Completion requires structured verification evidence.", "inputSchema": {"type": "object", "properties": {"task_id": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "blocked", "completed", "cancelled"]}, "evidence": {"type": "string"}}, "required": ["task_id", "status"]}},
     {"name": "recover_context", "description": "Recover the latest checkpoint, active project tasks, and recent project notes.", "inputSchema": {"type": "object", "properties": {"budget": {"type": "integer"}}}},
@@ -188,6 +189,14 @@ def _handle_request(request: object, root: str | Path | None, session: dict[str,
             try:
                 store = project_store(root)
                 if name == "sync_requirements": value = store.sync_requirements(args["text"])
+                elif name == "add_task":
+                    task_id, created = store.add_task(
+                        args["description"],
+                        priority=args.get("priority", 2),
+                        acceptance=args.get("acceptance", []),
+                        parent_id=args.get("parent_id"),
+                    )
+                    value = {"id": task_id, "created": created}
                 elif name == "list_tasks": value = store.list_tasks(["pending", "in_progress", "blocked"])
                 elif name == "set_task_status": store.set_status(args["task_id"], args["status"], args.get("evidence", "")); value = {"ok": True}
                 elif name == "recover_context": value = store.recover(args.get("budget", 12))

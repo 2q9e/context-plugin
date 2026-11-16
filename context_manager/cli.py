@@ -142,7 +142,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "hook":
                 event_input = text
                 if args.event in {"PreCompact", "preCompact"}:
-                    store.checkpoint("Automatic pre-compaction checkpoint", event_input[:1000], "Run cwm recover and continue pending tasks")
+                    if store.latest_checkpoint() is None:
+                        store.checkpoint("Automatic pre-compaction recovery marker", "", "Run cwm recover and continue pending tasks")
                 bundle = store.context_bundle(event_input, 5000)
                 context = "Persistent project checklist:\n" + "\n".join(f"- [{t['status']}] {t['description']} (id {t['id']})" for t in bundle["tasks"])
                 if bundle.get("notes"):
@@ -169,7 +170,7 @@ def main(argv: list[str] | None = None) -> int:
                     elif args.event == "beforeSubmitPrompt":
                         output = {"continue": True}
                     elif args.event == "preCompact":
-                        output = {"user_message": "Project checkpoint saved. Context recovery is available at the next session start."}
+                        output = {"user_message": "Project recovery context is available at the next session start."}
                     else:
                         output = {}
                 else:

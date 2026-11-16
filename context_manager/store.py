@@ -42,11 +42,15 @@ _SECRET_PATTERNS = [
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
 ]
+_PRIVATE_KEY_BLOCK = re.compile(
+    r"-----BEGIN (?P<label>[A-Z0-9 ]*PRIVATE KEY)-----.*?(?:-----END (?P=label)-----|\Z)",
+    flags=re.IGNORECASE | re.DOTALL,
+)
 
 
 def scrub(text: str) -> str:
     """Redact common credential formats before they enter persistent storage."""
-    result = text
+    result = _PRIVATE_KEY_BLOCK.sub("[REDACTED]", text)
     for pattern in _SECRET_PATTERNS:
         result = pattern.sub(lambda m: (m.group(1) + "=" if m.lastindex and m.group(1) else "") + "[REDACTED]", result)
     return result
@@ -54,12 +58,26 @@ def scrub(text: str) -> str:
 
 class Store:
     def __init__(self, path: str | Path):
-        self.path = Path(path).expanduser().resolve()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = Path(path).expanduser().absolute()
+        state_dir = self.path.parent
+        if state_dir.is_symlink() or self.path.is_symlink():
+            raise ValueError("Refusing to open a symlinked project state path")
+        for suffix in ("-wal", "-shm", "-journal"):
+            if Path(f"{self.path}{suffix}").is_symlink():
+                raise ValueError("Refusing to open a symlinked SQLite sidecar")
+        state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if state_dir.is_symlink() or self.path.is_symlink():
+            raise ValueError("Refusing to open a symlinked project state path")
+        if self.path.exists() and not self.path.is_file():
+            raise ValueError("The project state database path is not a regular file")
+        if os.name == "posix":
+            os.chmod(state_dir, 0o700)
         self.db = sqlite3.connect(self.path, timeout=15, isolation_level=None)
+        self._restrict_sqlite_permissions()
         self.db.row_factory = sqlite3.Row
         self._savepoint_counter = 0
         self.db.execute("PRAGMA journal_mode=WAL")
+        self._restrict_sqlite_permissions()
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA busy_timeout=15000")
         self._schema()
@@ -71,6 +89,19 @@ class Store:
             # holds the database; cleanup can report and retry the retention pass.
             self._pruned_on_open = {"events": 0, "checkpoints": 0}
             self._history_prune_error = str(error)
+        self._restrict_sqlite_permissions()
+
+    def _restrict_sqlite_permissions(self) -> None:
+        """Keep SQLite state private on POSIX, including WAL and SHM sidecars."""
+        if os.name != "posix":
+            return
+        os.chmod(self.path, 0o600)
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(f"{self.path}{suffix}")
+            if sidecar.is_symlink():
+                raise ValueError("Refusing to use a symlinked SQLite sidecar")
+            if sidecar.exists():
+                os.chmod(sidecar, 0o600)
 
     def close(self) -> None:
         self.db.close()
@@ -406,8 +437,9 @@ class Store:
         active_by_id = {t["id"]: t for t in self.list_tasks(["in_progress", "blocked", "pending"])}
         ordered = [active_by_id.pop(t["id"]) for t in matched if t["id"] in active_by_id]
         ordered.extend(sorted(active_by_id.values(), key=lambda t: (t["status"] != "in_progress", t["status"] != "blocked", t["priority"])))
-        cp_row = self.db.execute("SELECT summary,last_action,next_action,created_at FROM checkpoints ORDER BY created_at DESC LIMIT 1").fetchone()
-        cp = dict(cp_row) if cp_row else None
+        latest_checkpoint = self.latest_checkpoint()
+        cp = ({key: latest_checkpoint[key] for key in ("summary", "last_action", "next_action", "created_at")}
+              if latest_checkpoint else None)
         if cp:
             cp["summary"] = cp["summary"][:160]
             cp["last_action"] = cp["last_action"][:120]
@@ -469,14 +501,17 @@ class Store:
         self.db.execute("INSERT INTO checkpoints VALUES(?,?,?,?,?)", (checkpoint_id, scrub(summary), scrub(last_action), scrub(next_action), now()))
         return checkpoint_id
 
+    def latest_checkpoint(self) -> dict[str, Any] | None:
+        row = self.db.execute("SELECT * FROM checkpoints ORDER BY created_at DESC,rowid DESC LIMIT 1").fetchone()
+        return dict(row) if row else None
+
     def recover(self, budget: int = 12) -> dict[str, Any]:
         from .vault import ProjectVault
 
         tasks = self.list_tasks(["pending", "in_progress", "blocked"])
-        checkpoint = self.db.execute("SELECT * FROM checkpoints ORDER BY created_at DESC LIMIT 1").fetchone()
         recent = self.db.execute("SELECT kind,detail,created_at FROM events ORDER BY id DESC LIMIT 8").fetchall()
         return {"project_root": str(self.path.parent.parent), "active_tasks": tasks[:max(0, budget)],
-                "remaining_count": len(tasks), "checkpoint": dict(checkpoint) if checkpoint else None,
+                "remaining_count": len(tasks), "checkpoint": self.latest_checkpoint(),
                 "recent_events": [dict(r) for r in recent],
                 "recent_notes": ProjectVault(self.path.parent / "vault").recent_notes(limit=3)}
 

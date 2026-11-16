@@ -52,7 +52,7 @@ The automatic `sync` operation stores sanitized prompt clauses as candidate task
 ## Obsidian-compatible project notes
 
 Context Window Manager can keep durable project knowledge in a local Markdown vault at
-`.context-manager/vault/`. Notes are plain `.md` files with YAML frontmatter for an ID, title,
+`.context-manager/vault/`. Notes are plain `.md` files with YAML or JSON frontmatter for an ID, title,
 timestamps, tags, aliases, and custom scalar properties. Existing notes are read from disk on each request, so edits made in Obsidian
 or another Markdown editor are available without a separate import or index step. The SQLite
 database remains the source of truth for task state, dependencies, and checkpoints; vault notes
@@ -92,7 +92,7 @@ Install the package in the same environment as the host so `cwm` and `cwm-mcp` a
 
 ### Claude Code
 
-Merge [`integrations/claude/hooks.json`](integrations/claude/hooks.json) into `.claude/settings.json` (shared project) or `~/.claude/settings.json` (user scope). The UserPromptSubmit hook captures each prompt and adds the active checklist as `additionalContext`; SessionStart restores context; PreCompact saves a checkpoint. Claude Code terminal, IDE, desktop, and cloud sessions use their respective settings availability. See the [Claude Code hooks reference](https://code.claude.com/docs/en/hooks).
+Merge [`integrations/claude/hooks.json`](integrations/claude/hooks.json) into `.claude/settings.json` (shared project) or `~/.claude/settings.json` (user scope). The UserPromptSubmit hook captures each prompt and adds the active checklist as `additionalContext`; SessionStart restores context; PreCompact writes a recovery marker only when no checkpoint exists, preserving any detailed checkpoint already saved. The hook cannot infer completed work from the host transcript, so use `cwm checkpoint` to save detailed progress. Claude Code terminal, IDE, desktop, and cloud sessions use their respective settings availability. See the [Claude Code hooks reference](https://code.claude.com/docs/en/hooks).
 
 For MCP, merge the `mcpServers` entry from [`integrations/claude/mcp.json`](integrations/claude/mcp.json) into `.mcp.json`:
 
@@ -102,13 +102,13 @@ For MCP, merge the `mcpServers` entry from [`integrations/claude/mcp.json`](inte
 
 ### Codex
 
-Copy [`integrations/codex/hooks.json`](integrations/codex/hooks.json) to `.codex/hooks.json` in the project or `~/.codex/hooks.json`. Codex runs commands from the session working directory. UserPromptSubmit injects the active task bundle, SessionStart recovers it, and PreCompact checkpoints. Hook trust review may be required. Codex plugin-directory publication currently excludes lifecycle hooks, so use the project/user hooks configuration or a manually installed plugin. See [Codex hooks](https://developers.openai.com/codex/hooks) and [plugin packaging limits](https://developers.openai.com/plugins/guides/submit-claude-plugin).
+Copy [`integrations/codex/hooks.json`](integrations/codex/hooks.json) to `.codex/hooks.json` in the project or `~/.codex/hooks.json`. Codex runs commands from the session working directory. UserPromptSubmit injects the active task bundle, SessionStart recovers it, and PreCompact writes a recovery marker only when no checkpoint exists, preserving any detailed checkpoint already saved. The hook cannot infer completed work from the host transcript, so use `cwm checkpoint` to save detailed progress. Hook trust review may be required. Codex plugin-directory publication currently excludes lifecycle hooks, so use the project/user hooks configuration or a manually installed plugin. See [Codex hooks](https://developers.openai.com/codex/hooks) and [plugin packaging limits](https://developers.openai.com/plugins/guides/submit-claude-plugin).
 
 For MCP, merge [`integrations/codex/config.toml`](integrations/codex/config.toml) into the project's `.codex/config.toml` or `~/.codex/config.toml`. Codex loads project-level config only for trusted projects; use the user config when the project is not trusted ([Codex plugin configuration](https://developers.openai.com/plugins/build/plugins)). Keep hook and MCP settings in separate files if the Codex version warns about duplicate hook declarations.
 
 ### Cursor
 
-Merge [`integrations/cursor/hooks.json`](integrations/cursor/hooks.json) into `.cursor/hooks.json` in the project or `~/.cursor/hooks.json`. `beforeSubmitPrompt` captures prompt text, `sessionStart` can provide startup context, and `preCompact` checkpoints. Cursor's `beforeSubmitPrompt` response can allow or block submission but does not inject context; `sessionStart` is fire-and-forget, so context may arrive after the first response. Mid-session retrieval uses the MCP tools or repository instructions. Cloud-agent support differs; project hook configs are used when the agent has a writable environment. See [Cursor hooks](https://cursor.com/docs/hooks).
+Merge [`integrations/cursor/hooks.json`](integrations/cursor/hooks.json) into `.cursor/hooks.json` in the project or `~/.cursor/hooks.json`. In desktop sessions, `sessionStart` can provide startup context, `beforeSubmitPrompt` captures prompt text, and `preCompact` writes a recovery marker only when no checkpoint exists, preserving any detailed checkpoint already saved. `beforeSubmitPrompt` can allow or block submission but does not inject context; `sessionStart` is fire-and-forget, so context may arrive after the first response. These hooks cannot infer completed work from the host transcript, so use `cwm checkpoint` to save detailed progress. Cursor Cloud Agents do not run this config's `sessionStart` hook; project hooks can run once the agent has a writable environment, while user-level hooks are unavailable. Mid-session retrieval uses MCP tools or repository instructions. See [Cursor hooks](https://cursor.com/docs/hooks).
 
 For MCP, merge [`integrations/cursor/mcp.json`](integrations/cursor/mcp.json) into `.cursor/mcp.json` or the user MCP configuration.
 
@@ -118,7 +118,7 @@ Freebuff does not expose a general third-party lifecycle hook for every chat. Co
 
 ## Privacy and retention
 
-All data stays local by default. The store redacts common API keys, bearer tokens, passwords, and access tokens before persistence. Redaction patterns cannot recognize every secret format; review inputs and avoid deliberately sending secrets to hooks. Set `CWM_DISABLE_CAPTURE=1` to disable prompt capture while leaving manual task and recovery commands usable. Set `CWM_RETENTION_DAYS=N` to expire event history and checkpoints older than N days; task requirements are preserved.
+All data stays local by default. The store redacts common API keys, bearer tokens, passwords, access tokens, and PEM private-key blocks before persistence. Redaction patterns cannot recognize every secret format; review inputs and avoid deliberately sending secrets to hooks. Set `CWM_DISABLE_CAPTURE=1` to disable prompt capture while leaving manual task and recovery commands, including the MCP `add_task` tool, usable. Set `CWM_RETENTION_DAYS=N` to expire event history and checkpoints older than N days; task requirements are preserved.
 
 Run `cwm cleanup` to apply the configured history retention, remove abandoned note-write temp files older than a day, and compact the SQLite database. It preserves task state and Markdown notes. To remove the entire project state directory, including tasks, history, database, and notes, run `cwm cleanup --purge`; the CLI asks you to type `PURGE`. For a deliberate non-interactive removal, use `cwm cleanup --purge --yes`. The purge command refuses a symlinked `.context-manager` directory. Completion evidence is self-attested and stored; the tool does not run the referenced test or verify the files itself.
 

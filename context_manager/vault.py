@@ -1300,10 +1300,20 @@ class ProjectVault:
             raise ValueError("Refusing to update a note outside the project vault")
         original = path.read_text(encoding="utf-8")
         match = _FRONTMATTER.match(original)
-        updated = _quote(_now())
+        updated_value = _now()
+        updated = _quote(updated_value)
         if match:
             header = match.group("header")
-            if re.search(r"(?im)^updated\s*:", header):
+            stripped_header = header.strip()
+            try:
+                json_properties = json.loads(stripped_header) if stripped_header.startswith("{") else None
+            except json.JSONDecodeError:
+                json_properties = None
+            if isinstance(json_properties, dict):
+                updated_key = next((key for key in json_properties if str(key).casefold() == "updated"), "updated")
+                json_properties[updated_key] = updated_value
+                header = json.dumps(json_properties, ensure_ascii=False)
+            elif re.search(r"(?im)^updated\s*:", header):
                 header = re.sub(r"(?im)^(updated)\s*:\s*.*$", lambda item: f"{item.group(1)}: {updated}", header, count=1)
             else:
                 header += f"\nupdated: {updated}"
@@ -1360,12 +1370,22 @@ class ProjectVault:
                 candidates = by_key.get(key, [])
                 if len(candidates) == 1 and candidates[0]["id"] == target_doc["id"]:
                     return {"source": self._summary(source_doc), "target": self._summary(target_doc), "created": False}
-        section = "## Related notes"
-        if section.casefold() in body.casefold():
-            offset = body.casefold().find(section.casefold()) + len(section)
-            body = body[:offset].rstrip() + f"\n- {link}" + body[offset:]
+        normalized_body = body.replace("\r\n", "\n").replace("\r", "\n")
+        visible_lines = _link_text(normalized_body).splitlines(keepends=True)
+        source_lines = normalized_body.splitlines(keepends=True)
+        section_heading = re.compile(r"^ {0,3}##[ \t]+Related notes[ \t]*#*[ \t]*$", re.IGNORECASE)
+        offset = 0
+        insertion = None
+        for source_line, visible_line in zip(source_lines, visible_lines):
+            if section_heading.fullmatch(visible_line.rstrip("\r\n")):
+                insertion = offset + len(source_line)
+                break
+            offset += len(source_line)
+        if insertion is not None:
+            prefix, suffix = normalized_body[:insertion], normalized_body[insertion:]
+            body = prefix.rstrip() + f"\n- {link}\n" + suffix
         else:
-            body = body.rstrip() + f"\n\n{section}\n\n- {link}\n"
+            body = normalized_body.rstrip() + f"\n\n## Related notes\n\n- {link}\n"
         self._replace_body(source_doc, body)
         updated_by_key = self._key_index(self._documents())
         return {"source": self._summary(self._resolve_from_index(source_doc["id"], updated_by_key)),

@@ -162,23 +162,36 @@ class StoreTests(unittest.TestCase):
     def test_mcp_invalid_request_and_unknown_method_get_responses(self):
         from context_manager.mcp_server import main as mcp_main
         output = io.StringIO()
-        requests = '[]\n{"jsonrpc":"2.0","id":9,"method":"unknown/method"}\n'
+        requests = (
+            '[]\n'
+            '{"jsonrpc":"2.0","id":8,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}\n'
+            '{"jsonrpc":"2.0","id":9,"method":"unknown/method"}\n'
+        )
         with patch("sys.stdin", io.StringIO(requests)), redirect_stdout(output):
             mcp_main()
         responses = [json.loads(line) for line in output.getvalue().splitlines()]
         self.assertEqual(responses[0]["error"]["code"], -32600)
-        self.assertEqual(responses[1]["id"], 9)
-        self.assertEqual(responses[1]["error"]["code"], -32601)
+        self.assertEqual(responses[1]["id"], 8)
+        self.assertEqual(responses[2]["id"], 9)
+        self.assertEqual(responses[2]["error"]["code"], -32601)
 
     def test_mcp_tool_errors_are_returned_as_recoverable_tool_results(self):
         from context_manager.mcp_server import main as mcp_main
         output = io.StringIO()
-        request = {"jsonrpc": "2.0", "id": 10, "method": "tools/call", "params": {"name": "missing_tool", "arguments": {}}}
-        with patch("sys.stdin", io.StringIO(json.dumps(request) + "\n")), redirect_stdout(output):
+        requests = [
+            {"jsonrpc": "2.0", "id": 9, "method": "initialize", "params": {"protocolVersion": "2025-11-25"}},
+            {"jsonrpc": "2.0", "id": 10, "method": "tools/call", "params": {"name": "missing_tool", "arguments": {}}},
+            {"jsonrpc": "2.0", "id": 11, "method": "tools/call", "params": {"name": "sync_requirements", "arguments": {}}},
+        ]
+        with patch.dict(os.environ, {"CWM_PROJECT_ROOT": self.temp.name}), patch(
+            "sys.stdin", io.StringIO("".join(json.dumps(request) + "\n" for request in requests))
+        ), redirect_stdout(output):
             mcp_main()
-        response = json.loads(output.getvalue())
-        self.assertEqual(response["id"], 10)
-        self.assertTrue(response["result"]["isError"])
+        responses = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(responses[1]["id"], 10)
+        self.assertEqual(responses[1]["error"]["code"], -32602)
+        self.assertEqual(responses[2]["id"], 11)
+        self.assertTrue(responses[2]["result"]["isError"])
 
     def test_mcp_tool_notification_does_not_execute_mutation(self):
         from context_manager.mcp_server import main as mcp_main

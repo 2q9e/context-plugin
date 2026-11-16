@@ -7,6 +7,7 @@ import re
 import time
 import unicodedata
 import uuid
+from bisect import bisect_left, bisect_right
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ from .store import scrub
 _FRONTMATTER = re.compile(r"\A---\r?\n(?P<header>.*?)\r?\n---(?:\r?\n|$)", re.S)
 _WIKILINK = re.compile(r"!?\[\[([^\]]+)\]\]")
 _TEMP_NOTE_WRITE = re.compile(r"^\..+\.md\.[0-9a-f]{32}\.tmp$")
+_LIST_ITEM = re.compile(r"( {0,3})([-+*]|\d{1,9}[.)])([ \t]+|$)")
 
 
 def _now() -> str:
@@ -84,36 +86,427 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str, str | None]:
     return properties, text[match.end():], header
 
 
+def _strip_blockquotes(line: str) -> tuple[int, str]:
+    depth = 0
+    index = 0
+    while index < len(line):
+        start = index
+        spaces = 0
+        while index < len(line) and line[index] == " " and spaces < 3:
+            index += 1
+            spaces += 1
+        if index >= len(line) or line[index] != ">":
+            index = start
+            break
+        depth += 1
+        index += 1
+        if index < len(line) and line[index] in " \t":
+            index += 1
+    return depth, line[index:]
+
+
+def _expand_tabs(line: str) -> str:
+    """Expand tabs to CommonMark's four-column tab stops before block parsing."""
+    expanded: list[str] = []
+    column = 0
+    for char in line:
+        if char == "\t":
+            spaces = 4 - column % 4
+            expanded.append(" " * spaces)
+            column += spaces
+        else:
+            expanded.append(char)
+            column += 1
+    return "".join(expanded)
+
+
+def _columns(text: str, start_column: int = 0) -> int:
+    column = start_column
+    for char in text:
+        if char == " ":
+            column += 1
+        elif char == "\t":
+            column += 4 - column % 4
+        else:
+            break
+    return column - start_column
+
+
+def _remove_columns(text: str, columns: int) -> str | None:
+    """Remove indentation columns, preserving any overshoot from a tab."""
+    column = 0
+    index = 0
+    while index < len(text) and column < columns and text[index] in " \t":
+        char = text[index]
+        column += 1 if char == " " else 4 - column % 4
+        index += 1
+    if column < columns:
+        return None
+    return " " * (column - columns) + text[index:]
+
+
+def _strip_fence_prefixes(line: str, prefixes: list[tuple[str, int]]) -> str | None:
+    """Remove an opening fence's blockquote/list container prefixes in order."""
+    index = 0
+    for prefix_index, (kind, amount) in enumerate(prefixes):
+        if kind == "list":
+            consumed = 0
+            while index < len(line) and line[index] == " " and consumed < amount:
+                index += 1
+                consumed += 1
+            if consumed < amount:
+                if line[index:].strip() or any(
+                    later_kind == "quote" for later_kind, _ in prefixes[prefix_index + 1:]
+                ):
+                    return None
+                return ""
+            continue
+
+        start = index
+        spaces = 0
+        while index < len(line) and line[index] == " " and spaces < 3:
+            index += 1
+            spaces += 1
+        if index >= len(line) or line[index] != ">":
+            return None
+        index += 1
+        if index < len(line) and line[index] == " ":
+            index += 1
+        # Keep the no-progress case explicit if a future prefix kind is added.
+        if index == start:
+            return None
+    return line[index:]
+
+
+def _strip_list_items(line: str) -> tuple[str, int, int, list[int]]:
+    """Strip list markers and return their combined content indentation."""
+    index = 0
+    content_indent = 0
+    count = 0
+    indents: list[int] = []
+    while match := _LIST_ITEM.match(line, index):
+        leading, marker, padding = match.groups()
+        marker_column = content_indent + _columns(leading) + len(marker)
+        padding_columns = _columns(padding, marker_column) if padding else 0
+        padding_chars = len(padding)
+        if padding_columns > 4:
+            padding_columns = 1
+            padding_chars = 1
+        index += len(leading) + len(marker) + padding_chars
+        content_indent = marker_column + padding_columns
+        indents.append(content_indent)
+        count += 1
+        if not padding:
+            break
+    return line[index:], content_indent, count, indents
+
+
+def _fit_list_context(text: str, indents: list[int]) -> tuple[int, str] | None:
+    available = _columns(text)
+    match = bisect_right(indents, available) - 1
+    if match < 0:
+        return None
+    indent = indents[match]
+    stripped = _remove_columns(text, indent)
+    return (indent, stripped) if stripped is not None else None
+
+
+def _remember_list_context(contexts: dict[int, list[int]], quote_depth: int, indent: int) -> None:
+    if indent <= 0:
+        return
+    levels = contexts.setdefault(quote_depth, [])
+    if not levels or indent > levels[-1]:
+        levels.append(indent)
+    elif indent < levels[-1]:
+        del levels[bisect_left(levels, indent):]
+        levels.append(indent)
+
+
+def _mask_inline_code(paragraph: str) -> str:
+    """Mask CommonMark code spans in linear time, honoring escaped openers."""
+    runs: list[tuple[int, int, bool]] = []
+    index = 0
+    while index < len(paragraph):
+        if paragraph[index] != "`":
+            index += 1
+            continue
+        end = index + 1
+        while end < len(paragraph) and paragraph[end] == "`":
+            end += 1
+        backslashes = 0
+        cursor = index - 1
+        while cursor >= 0 and paragraph[cursor] == "\\":
+            backslashes += 1
+            cursor -= 1
+        runs.append((index, end, bool(backslashes % 2)))
+        index = end
+
+    next_same_length: dict[int, int] = {}
+    last_by_length: dict[int, int] = {}
+    for run_index, (start, end, _) in enumerate(runs):
+        length = end - start
+        previous = last_by_length.get(length)
+        if previous is not None:
+            next_same_length[previous] = run_index
+        last_by_length[length] = run_index
+
+    visible = list(paragraph)
+    run_index = 0
+    while run_index < len(runs):
+        start, end, escaped = runs[run_index]
+        closer = next_same_length.get(run_index)
+        if escaped or closer is None:
+            run_index += 1
+            continue
+        close_end = runs[closer][1]
+        for position in range(start, close_end):
+            if visible[position] != "\n":
+                visible[position] = " "
+        run_index = closer + 1
+    return "".join(visible)
+
+
 def _link_text(text: str) -> str:
-    """Return wiki links outside fenced and inline code."""
+    """Return wiki links outside CommonMark fenced, indented, and inline code."""
+    # CommonMark accepts LF, CRLF, and bare CR as line endings.
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     visible: list[str] = []
     fence_char: str | None = None
     fence_length = 0
-    for line in text.splitlines(keepends=True):
-        newline = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+    fence_prefixes: list[tuple[str, int]] = []
+    fence_quote_depth = 0
+    paragraph_open = False
+    previous_quote_depth: int | None = None
+    list_contexts: dict[int, list[int]] = {}
+
+    lines = text.split("\n")
+    for line_index, line in enumerate(lines):
+        newline = "\n" if line_index < len(lines) - 1 else ""
+        source = _expand_tabs(line)
+        # A top-level list's continuation indentation comes before any nested
+        # blockquote marker. Lists inside blockquotes take the opposite order:
+        # strip the enclosing quote first, then the list indentation.
+        prequote_list_indent = 0
+        quote_source = source
+        root_context = _fit_list_context(source, list_contexts.get(0, []))
+        if root_context is not None:
+            prequote_list_indent, quote_source = root_context
+            root_levels = list_contexts[0]
+            del root_levels[bisect_right(root_levels, prequote_list_indent):]
+        quote_depth, quoted = _strip_blockquotes(quote_source)
+
         if fence_char:
-            closing = re.match(rf"^ {{0,3}}{re.escape(fence_char)}{{{fence_length},}}[ \t]*(?:\r?\n)?$", line)
-            if closing:
+            # Reapply each containing block prefix in its original order. A
+            # list can contain a quote (or vice versa), so testing all quote
+            # markers before all list indentation loses valid fence closers.
+            fence_content = _strip_fence_prefixes(source, fence_prefixes)
+            if fence_content is None:
                 fence_char = None
                 fence_length = 0
-            visible.append(newline)
-            continue
+                paragraph_open = False
+            else:
+                closing = re.fullmatch(
+                    rf" {{0,3}}{re.escape(fence_char)}{{{fence_length},}}[ \t]*",
+                    fence_content,
+                )
+                if closing:
+                    fence_char = None
+                    fence_length = 0
+                    paragraph_open = False
+                visible.append(newline)
+                previous_quote_depth = fence_quote_depth
+                continue
 
-        opening = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+        if quote_depth > 0 and not prequote_list_indent:
+            # An unindented quote is outside a top-level list container.
+            list_contexts.pop(0, None)
+        if previous_quote_depth is not None and quote_depth < previous_quote_depth and not paragraph_open:
+            for depth in tuple(list_contexts):
+                if depth > quote_depth:
+                    list_contexts.pop(depth, None)
+
+        list_input = quoted
+        postquote_list_indent = 0
+        quote_context = _fit_list_context(quoted, list_contexts.get(quote_depth, []))
+        if quote_context is not None and not (prequote_list_indent and quote_depth == 0):
+            postquote_list_indent, list_input = quote_context
+            quote_levels = list_contexts[quote_depth]
+            del quote_levels[bisect_right(quote_levels, postquote_list_indent):]
+        elif list_contexts.get(quote_depth) and not paragraph_open and quoted.strip():
+            list_contexts.pop(quote_depth, None)
+
+        list_content, local_list_indent, list_count, local_list_indents = _strip_list_items(list_input)
+        opening_prefixes: list[tuple[str, int]] = []
+        if prequote_list_indent:
+            opening_prefixes.append(("list", prequote_list_indent))
+        opening_prefixes.extend([("quote", 1)] * quote_depth)
+        if postquote_list_indent:
+            opening_prefixes.append(("list", postquote_list_indent))
+        if list_count:
+            opening_prefixes.append(("list", local_list_indent))
+
+        list_context_updates: dict[int, list[int]] = {}
+        if prequote_list_indent:
+            list_context_updates[0] = (
+                [prequote_list_indent + indent for indent in local_list_indents]
+                if list_count and quote_depth == 0 else [prequote_list_indent]
+            )
+        if quote_depth > 0 and (postquote_list_indent or list_count):
+            list_context_updates[quote_depth] = (
+                [postquote_list_indent + indent for indent in local_list_indents]
+                if list_count else [postquote_list_indent]
+            )
+        elif quote_depth == 0 and not prequote_list_indent and list_count:
+            list_context_updates[0] = local_list_indents
+
+        # Containers can alternate on a single line, for example a list item
+        # containing a quote containing another list item. Record their order
+        # so later lines must carry the same prefixes to remain in the fence.
+        while True:
+            nested_quote_depth, nested_content = _strip_blockquotes(list_content)
+            if nested_quote_depth:
+                opening_prefixes.extend([("quote", 1)] * nested_quote_depth)
+                quote_depth += nested_quote_depth
+                list_content = nested_content
+                nested_context = _fit_list_context(list_content, list_contexts.get(quote_depth, []))
+                if nested_context is not None:
+                    nested_indent, list_content = nested_context
+                    opening_prefixes.append(("list", nested_indent))
+                    list_context_updates[quote_depth] = [nested_indent]
+            nested_list_content, nested_list_indent, nested_list_count, nested_list_indents = _strip_list_items(list_content)
+            if not nested_list_count:
+                break
+            opening_prefixes.append(("list", nested_list_indent))
+            list_content = nested_list_content
+            list_count += nested_list_count
+            nested_context_base = list_context_updates.get(quote_depth, [])
+            base_indent = nested_context_base[-1] if nested_context_base else 0
+            list_context_updates[quote_depth] = [base_indent + indent for indent in nested_list_indents]
+        opening = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", list_content)
         if opening:
             marker = opening.group(1)
-            # CommonMark forbids backticks in the info string of a backtick fence.
-            if marker[0] == "`" and "`" in line[opening.end():]:
-                visible.append(line)
+            # Backtick fences cannot have a backtick in their info string.
+            if marker[0] != "`" or "`" not in opening.group(2):
+                fence_char = marker[0]
+                fence_length = len(marker)
+                fence_prefixes = opening_prefixes
+                fence_quote_depth = sum(kind == "quote" for kind, _ in opening_prefixes)
+                for context_depth, indents in list_context_updates.items():
+                    for indent in indents:
+                        _remember_list_context(list_contexts, context_depth, indent)
+                visible.append(newline)
+                paragraph_open = False
+                previous_quote_depth = quote_depth
                 continue
-            fence_char = marker[0]
-            fence_length = len(marker)
-            visible.append(newline)
-            continue
-        visible.append(line)
 
-    text = "".join(visible)
-    return re.sub(r"(?<!`)(?P<ticks>`+)(?!`).*?(?<!`)(?P=ticks)(?!`)", "", text, flags=re.S)
+        blank = not list_content.strip()
+        if blank:
+            visible.append(newline)
+            paragraph_open = False
+            for depth in tuple(list_contexts):
+                if depth > quote_depth:
+                    list_contexts.pop(depth, None)
+            previous_quote_depth = quote_depth
+            continue
+
+        # A list marker or a new block quote starts a new block. An unmarked
+        # line may lazily continue a paragraph in an open blockquote.
+        if list_count:
+            paragraph_open = False
+            for context_depth, indents in list_context_updates.items():
+                for indent in indents:
+                    _remember_list_context(list_contexts, context_depth, indent)
+        heading = bool(re.match(r"^ {0,3}#{1,6}(?:[ \t]|$)", list_content))
+        thematic_break = bool(re.match(r"^ {0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$", list_content))
+        html_block = bool(re.match(r"^ {0,3}<!--|^ {0,3}</?[A-Za-z][^>]*>", list_content))
+        quote_changed = previous_quote_depth is not None and quote_depth != previous_quote_depth
+        lazy_quote_continuation = (
+            quote_changed
+            and previous_quote_depth is not None
+            and quote_depth < previous_quote_depth
+            and paragraph_open
+            and not list_count
+            and not heading
+            and not thematic_break
+            and not html_block
+        )
+        if quote_changed and not lazy_quote_continuation:
+            paragraph_open = False
+            for depth in tuple(list_contexts):
+                if depth > quote_depth:
+                    list_contexts.pop(depth, None)
+        if not paragraph_open and _columns(list_content) >= 4:
+            visible.append(newline)
+            paragraph_open = False
+            previous_quote_depth = quote_depth
+            continue
+
+        visible.append(line + newline)
+        paragraph_open = not (heading or thematic_break or html_block)
+        previous_quote_depth = quote_depth
+
+    # A blank line or a block boundary prevents inline delimiters in separate
+    # paragraphs from pairing. Mask each remaining paragraph independently.
+    masked: list[str] = []
+    paragraph: list[str] = []
+
+    def flush_paragraph() -> None:
+        if paragraph:
+            masked.append(_mask_inline_code("".join(paragraph)))
+            paragraph.clear()
+
+    quote_context: int | None = None
+    list_context = 0
+    for line in visible:
+        source = _expand_tabs(line[:-1] if line.endswith("\n") else line)
+        quote_depth, quoted = _strip_blockquotes(source)
+        list_content, list_indent, list_count, _ = _strip_list_items(quoted)
+        nested_quote_depth, nested_content = _strip_blockquotes(list_content)
+        if nested_quote_depth:
+            quote_depth += nested_quote_depth
+            list_content = nested_content
+            list_indent = 0
+            nested_list_content, nested_list_indent, nested_list_count, _ = _strip_list_items(list_content)
+            if nested_list_count:
+                list_content = nested_list_content
+                list_indent = nested_list_indent
+                list_count += nested_list_count
+        if not source.strip():
+            flush_paragraph()
+            masked.append(line)
+            quote_context = None
+            list_context = 0
+            continue
+        heading = bool(re.match(r"^ {0,3}#{1,6}(?:[ \t]|$)", list_content))
+        thematic_break = bool(re.match(r"^ {0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$", list_content))
+        html_block = bool(re.match(r"^ {0,3}<!--|^ {0,3}</?[A-Za-z][^>]*>", list_content))
+        quote_change = quote_context is not None and quote_depth != quote_context
+        block_start = list_count or heading or thematic_break or html_block or (
+            quote_context is not None and quote_depth > quote_context
+        )
+        lazy_continuation = bool(paragraph) and not block_start and (
+            list_context > 0 or (quote_context is not None and quote_depth < quote_context)
+        )
+        if quote_change and not lazy_continuation:
+            flush_paragraph()
+            list_context = 0
+        if heading or thematic_break:
+            flush_paragraph()
+            masked.append(_mask_inline_code(line))
+            flush_paragraph()
+            quote_context = quote_depth
+            list_context = 0
+            continue
+        if list_count:
+            flush_paragraph()
+            list_context = list_indent
+        elif list_context and _columns(quoted) < list_context and not lazy_continuation:
+            flush_paragraph()
+            list_context = 0
+        paragraph.append(line)
+        quote_context = quote_depth
+    flush_paragraph()
+    return "".join(masked)
 
 
 def _link_target(value: str) -> str:

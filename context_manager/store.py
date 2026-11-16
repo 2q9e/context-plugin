@@ -299,8 +299,12 @@ class Store:
 
     def context_bundle(self, query: str, char_budget: int = 6000) -> dict[str, Any]:
         """Return a small prioritized recovery bundle bounded by rendered characters."""
+        from .vault import ProjectVault
+
         char_budget = max(256, min(char_budget, 100_000))
         matched = self.search(query, limit=100)
+        vault = ProjectVault(self.path.parent / "vault")
+        notes = vault.search_notes(query, limit=8) if query.strip() else vault.recent_notes(limit=3)
         active_by_id = {t["id"]: t for t in self.list_tasks(["in_progress", "blocked", "pending"])}
         ordered = [active_by_id.pop(t["id"]) for t in matched if t["id"] in active_by_id]
         ordered.extend(sorted(active_by_id.values(), key=lambda t: (t["status"] != "in_progress", t["status"] != "blocked", t["priority"])))
@@ -311,13 +315,40 @@ class Store:
             cp["last_action"] = cp["last_action"][:120]
             cp["next_action"] = cp["next_action"][:120]
         selected = []
-        def rendered(items: list[dict[str, Any]], omitted: int) -> str:
-            return json.dumps({"checkpoint": cp, "tasks": items, "omitted_tasks": omitted, "character_budget": char_budget}, ensure_ascii=False)
+        selected_notes: list[dict[str, Any]] = []
+
+        def rendered(items: list[dict[str, Any]], omitted: int,
+                     note_items: list[dict[str, Any]], omitted_notes: int) -> str:
+            return json.dumps({"checkpoint": cp, "tasks": items, "notes": note_items,
+                               "omitted_tasks": omitted, "omitted_notes": omitted_notes,
+                               "character_budget": char_budget}, ensure_ascii=False)
+
+        task_budget = char_budget - min(1800, char_budget // 3) if notes else char_budget
         for task in ordered:
-            if len(rendered(selected + [task], len(ordered) - len(selected) - 1)) > char_budget:
+            if len(rendered(selected + [task], len(ordered) - len(selected) - 1,
+                            [], len(notes))) > task_budget:
                 continue
             selected.append(task)
-        result = {"checkpoint": cp, "tasks": selected, "omitted_tasks": len(ordered) - len(selected), "character_budget": char_budget}
+
+        for note in notes:
+            candidate = selected_notes + [note]
+            if len(rendered(selected, len(ordered) - len(selected), candidate,
+                            len(notes) - len(candidate))) <= char_budget:
+                selected_notes.append(note)
+
+        selected_ids = {task["id"] for task in selected}
+        for task in ordered:
+            if task["id"] in selected_ids:
+                continue
+            candidate = selected + [task]
+            if len(rendered(candidate, len(ordered) - len(candidate), selected_notes,
+                            len(notes) - len(selected_notes))) <= char_budget:
+                selected.append(task)
+                selected_ids.add(task["id"])
+
+        result = {"checkpoint": cp, "tasks": selected, "notes": selected_notes,
+                  "omitted_tasks": len(ordered) - len(selected),
+                  "omitted_notes": len(notes) - len(selected_notes), "character_budget": char_budget}
         for field in ("summary", "last_action", "next_action"):
             while cp and len(json.dumps(result, ensure_ascii=False)) > char_budget and cp[field]:
                 cp[field] = cp[field][:max(0, len(cp[field]) - 64)]
@@ -329,6 +360,10 @@ class Store:
             selected.pop()
             result["tasks"] = selected
             result["omitted_tasks"] = len(ordered) - len(selected)
+        while selected_notes and len(json.dumps(result, ensure_ascii=False)) > char_budget:
+            selected_notes.pop()
+            result["notes"] = selected_notes
+            result["omitted_notes"] = len(notes) - len(selected_notes)
         return result
 
     def checkpoint(self, summary: str, last_action: str = "", next_action: str = "") -> str:
@@ -337,12 +372,15 @@ class Store:
         return checkpoint_id
 
     def recover(self, budget: int = 12) -> dict[str, Any]:
+        from .vault import ProjectVault
+
         tasks = self.list_tasks(["pending", "in_progress", "blocked"])
         checkpoint = self.db.execute("SELECT * FROM checkpoints ORDER BY created_at DESC LIMIT 1").fetchone()
         recent = self.db.execute("SELECT kind,detail,created_at FROM events ORDER BY id DESC LIMIT 8").fetchall()
         return {"project_root": str(self.path.parent.parent), "active_tasks": tasks[:max(0, budget)],
                 "remaining_count": len(tasks), "checkpoint": dict(checkpoint) if checkpoint else None,
-                "recent_events": [dict(r) for r in recent]}
+                "recent_events": [dict(r) for r in recent],
+                "recent_notes": ProjectVault(self.path.parent / "vault").recent_notes(limit=3)}
 
     def search(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
         terms = [x for x in normalize(query).split() if len(x) > 1]

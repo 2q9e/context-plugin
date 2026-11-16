@@ -45,6 +45,37 @@ cwm recover --budget 10
 
 The automatic `sync` operation stores sanitized prompt clauses as candidate tasks. It is intentionally conservative: it cannot reliably determine which sentences are requirements, decisions, or discussion. The agent should compare each incoming message against existing work and call the MCP `sync_requirements` tool with any semantic additions, revisions, and cancellations it identifies. A changed requirement is reset to pending and has an event entry preserving the previous description.
 
+## Obsidian-compatible project notes
+
+Context Window Manager can keep durable project knowledge in a local Markdown vault at
+`.context-manager/vault/`. Notes are plain `.md` files with YAML frontmatter for an ID, title,
+timestamps, and optional tags. Existing notes are read from disk on each request, so edits made in Obsidian
+or another Markdown editor are available without a separate import or index step. The SQLite
+database remains the source of truth for task state, dependencies, and checkpoints; vault notes
+hold supporting context, decisions, and project knowledge.
+
+Create and connect notes with the CLI:
+
+```sh
+cwm vault path
+cwm vault create "Login flow" --content "The login page is the authentication entry point."
+cwm vault create "Authentication decisions" --tag architecture --tag auth --content "Use [[Login flow]] as the entry point."
+cwm vault search "login"
+cwm vault links "Authentication decisions"
+cwm vault backlinks "Login flow"
+```
+
+If the project is not already inside an Obsidian vault, open the printed directory with **Open folder
+as vault**. If it is inside an existing vault, keep this as a folder in that vault rather than opening
+a nested vault; Obsidian warns that links may not update correctly between nested vaults. Notes use
+Obsidian-compatible `[[wikilinks]]`; outgoing links and backlinks are resolved from Markdown as
+needed. `search_context` also includes a few relevant note excerpts when they fit the character
+budget, so recovered project context can include both active work and durable knowledge. The MCP
+server exposes note list, search, read, create, append, link, and backlink tools. Note writes and
+content returned to the host pass through the common-credential scrubber. Notes remain local files;
+the server does not sync notes or call a remote service. A connected agent receives requested note
+content through MCP or hooks and applies its own data-handling policy.
+
 ## Host integrations
 
 Install the package in the same environment as the host so `cwm` and `cwm-mcp` are on `PATH`. Copy the relevant config example into the host's documented config location and merge it with existing settings rather than replacing them.
@@ -81,7 +112,7 @@ All data stays local by default. The store redacts common API keys, bearer token
 
 ## Architecture
 
-`context_manager/store.py` owns transactional SQLite persistence, requirement reconciliation, dependency validation, privacy filters, context selection, and recovery. `cli.py` implements direct use and host hook responses. `mcp_server.py` offers stdio tools using the same database. Host configs remain thin and optional. The core uses a lexical token-overlap scorer, not embeddings or a language model; `--chars` limits serialized context size, not true model tokens.
+`context_manager/store.py` owns transactional SQLite persistence, requirement reconciliation, dependency validation, privacy filters, task context selection, and recovery. `context_manager/vault.py` reads and writes portable Markdown notes, metadata, and note links; the files are the notes' source of truth. `cli.py` implements direct use and host hook responses. `mcp_server.py` offers stdio tools over the same project state. Host configs remain thin and optional. The core uses lexical token-overlap scoring, not embeddings or a language model; `--chars` limits serialized context size, not true model tokens.
 
 See [`docs/REFERENCE_RESEARCH.md`](docs/REFERENCE_RESEARCH.md) for source-level reference notes and [`DEVELOPMENT_CHECKLIST.md`](DEVELOPMENT_CHECKLIST.md) for the implementation status.
 

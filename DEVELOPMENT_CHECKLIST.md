@@ -8,6 +8,7 @@ This checklist tracks the repository implementation against the assignment. Each
 - [x] Implement candidate prompt capture, deduplication, append-on-new behavior, explicit requirement changes/cancellations, credential redaction, and capture opt-out.
 - [x] Implement bounded lexical retrieval, session recovery, privacy retention controls, and dependency completion checks.
 - [x] Implement the CLI and MCP stdio server over the same project store.
+- [x] Add an Obsidian-compatible project notes vault with Markdown properties/tags, wikilinks/backlinks, search, and CLI/MCP access; automated tests were not run for this increment.
 - [x] Add Claude Code, Codex, Cursor, and Freebuff integration examples with documented platform limits.
 - [x] Verify JSON/TOML examples parse and check current Claude Code, Codex, Cursor, and Freebuff hook/agent schemas.
 - [x] Run the automated suite: 15 tests passed, including the reset/recovery end-to-end simulation.

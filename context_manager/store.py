@@ -61,7 +61,14 @@ class Store:
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA busy_timeout=15000")
         self._schema()
-        self._prune_history()
+        self._history_prune_error = None
+        try:
+            self._pruned_on_open = self._prune_history()
+        except sqlite3.Error as error:
+            # Opening a project should still work when another process briefly
+            # holds the database; cleanup can report and retry the retention pass.
+            self._pruned_on_open = {"events": 0, "checkpoints": 0}
+            self._history_prune_error = str(error)
 
     def close(self) -> None:
         self.db.close()
@@ -89,8 +96,9 @@ class Store:
         CREATE INDEX IF NOT EXISTS events_task_idx ON events(task_id, id);
         """)
 
-    def _prune_history(self) -> None:
+    def _prune_history(self) -> dict[str, int]:
         """Optional retention applies to history only; active requirements remain durable."""
+        removed = {"events": 0, "checkpoints": 0}
         try:
             days = int(os.environ.get("CWM_RETENTION_DAYS", "0"))
         except ValueError:
@@ -98,8 +106,47 @@ class Store:
         if days > 0:
             cutoff = datetime.now(timezone.utc).timestamp() - days * 86400
             cutoff_text = datetime.fromtimestamp(cutoff, timezone.utc).isoformat(timespec="seconds")
-            self.db.execute("DELETE FROM events WHERE created_at < ?", (cutoff_text,))
-            self.db.execute("DELETE FROM checkpoints WHERE created_at < ?", (cutoff_text,))
+            removed["events"] = max(0, self.db.execute("DELETE FROM events WHERE created_at < ?", (cutoff_text,)).rowcount)
+            removed["checkpoints"] = max(0, self.db.execute("DELETE FROM checkpoints WHERE created_at < ?", (cutoff_text,)).rowcount)
+        return removed
+
+    def cleanup(self) -> dict[str, Any]:
+        """Apply history retention, remove abandoned note temp files, and compact SQLite."""
+        history_error = self._history_prune_error
+        try:
+            pruned_now = self._prune_history()
+        except sqlite3.Error as error:
+            pruned_now = {"events": 0, "checkpoints": 0}
+            history_error = str(error)
+        removed_on_open = getattr(self, "_pruned_on_open", {"events": 0, "checkpoints": 0})
+        result: dict[str, Any] = {
+            "expired_events_removed": removed_on_open["events"] + pruned_now["events"],
+            "expired_checkpoints_removed": removed_on_open["checkpoints"] + pruned_now["checkpoints"],
+            "history_cleanup_error": history_error,
+            "stale_note_temp_files_removed": 0,
+            "note_temp_cleanup_failures": 0,
+            "sqlite_compacted": False,
+            "sqlite_cleanup_error": None,
+        }
+        self._pruned_on_open = {"events": 0, "checkpoints": 0}
+        self._history_prune_error = None
+
+        from .vault import ProjectVault
+
+        notes = ProjectVault(self.path.parent / "vault").cleanup()
+        result["stale_note_temp_files_removed"] = notes["removed_temp_files"]
+        result["note_temp_cleanup_failures"] = notes["failed_temp_files"]
+
+        try:
+            checkpoint = self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            if checkpoint and int(checkpoint[0]):
+                result["sqlite_cleanup_error"] = "WAL checkpoint is busy; SQLite vacuum was skipped"
+                return result
+            self.db.execute("VACUUM")
+            result["sqlite_compacted"] = True
+        except sqlite3.Error as error:
+            result["sqlite_cleanup_error"] = str(error)
+        return result
 
     def _event(self, task_id: str | None, kind: str, detail: str) -> None:
         self.db.execute("INSERT INTO events(task_id,kind,detail,created_at) VALUES(?,?,?,?)", (task_id, kind, detail, now()))

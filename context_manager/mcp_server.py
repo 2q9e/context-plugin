@@ -21,6 +21,7 @@ TOOLS = [
     {"name": "link_notes", "description": "Add an Obsidian wikilink from one project note to another.", "inputSchema": {"type": "object", "properties": {"source": {"type": "string"}, "target": {"type": "string"}}, "required": ["source", "target"]}},
     {"name": "note_links", "description": "List outgoing Obsidian wikilinks from a project note, including unresolved links.", "inputSchema": {"type": "object", "properties": {"reference": {"type": "string"}}, "required": ["reference"]}},
     {"name": "note_backlinks", "description": "List project notes that link to a selected note.", "inputSchema": {"type": "object", "properties": {"reference": {"type": "string"}}, "required": ["reference"]}},
+    {"name": "cleanup_project_state", "description": "Apply configured history retention, remove abandoned note-write temp files, and compact the project database while preserving notes and tasks.", "inputSchema": {"type": "object", "properties": {}}},
 ]
 
 
@@ -73,6 +74,7 @@ def main() -> None:
                     elif name == "link_notes": value = ProjectVault(store.path.parent / "vault").link_notes(args["source"], args["target"])
                     elif name == "note_links": value = ProjectVault(store.path.parent / "vault").note_links(args["reference"])
                     elif name == "note_backlinks": value = ProjectVault(store.path.parent / "vault").backlinks(args["reference"])
+                    elif name == "cleanup_project_state": value = store.cleanup()
                     else: raise ValueError(f"Unknown tool: {name}")
                     result = {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False)}]}
                 except Exception as error:

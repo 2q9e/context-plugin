@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import unicodedata
 import uuid
 from datetime import datetime, timezone
@@ -16,6 +17,7 @@ from .store import scrub
 
 _FRONTMATTER = re.compile(r"\A---\r?\n(?P<header>.*?)\r?\n---(?:\r?\n|$)", re.S)
 _WIKILINK = re.compile(r"!?\[\[([^\]]+)\]\]")
+_TEMP_NOTE_WRITE = re.compile(r"^\..+\.md\.[0-9a-f]{32}\.tmp$")
 
 
 def _now() -> str:
@@ -172,6 +174,29 @@ class ProjectVault:
 
     def _documents(self) -> list[dict[str, Any]]:
         return [doc for path in self._files() if (doc := self._document(path)) is not None]
+
+    def cleanup(self, older_than_seconds: int = 86_400) -> dict[str, int]:
+        """Remove abandoned note-rewrite temp files older than one day."""
+        result = {"removed_temp_files": 0, "failed_temp_files": 0}
+        if not self.root.is_dir() or self.root.is_symlink():
+            return result
+        cutoff = time.time() - max(86_400, older_than_seconds)
+        for path in self.root.rglob("*"):
+            try:
+                relative = path.relative_to(self.root)
+                if any(part.startswith(".") for part in relative.parts[:-1]):
+                    continue
+                if path.is_symlink() or not path.is_file() or not _TEMP_NOTE_WRITE.fullmatch(path.name):
+                    continue
+                if not path.resolve().is_relative_to(self._real_root) or path.stat().st_mtime >= cutoff:
+                    continue
+                path.unlink()
+                result["removed_temp_files"] += 1
+            except FileNotFoundError:
+                continue
+            except OSError:
+                result["failed_temp_files"] += 1
+        return result
 
     @staticmethod
     def _keys(doc: dict[str, Any]) -> set[str]:

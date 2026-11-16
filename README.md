@@ -108,7 +108,9 @@ Freebuff does not expose a general third-party lifecycle hook for every chat. Co
 
 ## Privacy and retention
 
-All data stays local by default. The store redacts common API keys, bearer tokens, passwords, and access tokens before persistence. Redaction patterns cannot recognize every secret format; review inputs and avoid deliberately sending secrets to hooks. Set `CWM_DISABLE_CAPTURE=1` to disable prompt capture while leaving manual task and recovery commands usable. Set `CWM_RETENTION_DAYS=N` to expire event history and checkpoints older than N days; task requirements are preserved. Delete `.context-manager/` to remove all project state. Completion evidence is self-attested and stored; the tool does not run the referenced test or verify the files itself.
+All data stays local by default. The store redacts common API keys, bearer tokens, passwords, and access tokens before persistence. Redaction patterns cannot recognize every secret format; review inputs and avoid deliberately sending secrets to hooks. Set `CWM_DISABLE_CAPTURE=1` to disable prompt capture while leaving manual task and recovery commands usable. Set `CWM_RETENTION_DAYS=N` to expire event history and checkpoints older than N days; task requirements are preserved.
+
+Run `cwm cleanup` to apply the configured history retention, remove abandoned note-write temp files older than a day, and compact the SQLite database. It preserves task state and Markdown notes. To remove the entire project state directory, including tasks, history, database, and notes, run `cwm cleanup --purge`; the CLI asks you to type `PURGE`. For a deliberate non-interactive removal, use `cwm cleanup --purge --yes`. The purge command refuses a symlinked `.context-manager` directory. Completion evidence is self-attested and stored; the tool does not run the referenced test or verify the files itself.
 
 ## Architecture
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 from .store import project_store
@@ -76,9 +77,57 @@ def main(argv: list[str] | None = None) -> int:
     vault_links.add_argument("reference")
     vault_backlinks = vault_subs.add_parser("backlinks", help="List notes that link to a note")
     vault_backlinks.add_argument("reference")
+    cleanup = subs.add_parser("cleanup", help="Expire old history and remove abandoned temporary files")
+    cleanup.add_argument("--purge", action="store_true", help="Permanently remove all project state, including notes and tasks")
+    cleanup.add_argument("--yes", action="store_true", help="Confirm --purge without an interactive prompt")
     args = parser.parse_args(argv)
+
+    if args.command == "cleanup":
+        if args.yes and not args.purge:
+            parser.error("--yes requires --purge")
+        project_root = Path(args.root or os.getcwd()).expanduser().resolve()
+        if project_root.is_file():
+            project_root = project_root.parent
+        state_dir = project_root / ".context-manager"
+        if state_dir.is_symlink():
+            parser.error(f"Refusing to clean a symlinked project-state directory: {state_dir}")
+        if args.purge:
+            if not state_dir.exists():
+                print(json.dumps({"purged": False, "path": str(state_dir), "message": "No project state found"}))
+                return 0
+            if not args.yes:
+                if not sys.stdin.isatty() or not sys.stdout.isatty():
+                    parser.error("--purge requires an interactive terminal or explicit --yes")
+                confirmation = input(f"Type PURGE to permanently delete {state_dir}: ").strip()
+                if confirmation != "PURGE":
+                    print("Purge cancelled.")
+                    return 1
+            if state_dir.is_dir():
+                shutil.rmtree(state_dir)
+            else:
+                state_dir.unlink()
+            print(json.dumps({"purged": True, "path": str(state_dir)}))
+            return 0
+        if not state_dir.exists():
+            print(json.dumps({
+                "expired_events_removed": 0,
+                "expired_checkpoints_removed": 0,
+                "history_cleanup_error": None,
+                "stale_note_temp_files_removed": 0,
+                "note_temp_cleanup_failures": 0,
+                "sqlite_compacted": False,
+                "sqlite_cleanup_error": None,
+                "message": "No project state found",
+            }, ensure_ascii=False))
+            return 0
+        if not state_dir.is_dir():
+            parser.error(f"Project-state path is not a directory: {state_dir}")
+
     store = project_store(args.root)
     try:
+        if args.command == "cleanup":
+            print(json.dumps(store.cleanup(), ensure_ascii=False))
+            return 0
         if args.command == "init":
             print(store.path); return 0
         if args.command in {"sync", "hook"}:

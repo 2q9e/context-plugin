@@ -8,6 +8,7 @@ from unittest.mock import patch
 from contextlib import redirect_stdout
 
 from context_manager.store import Store
+from context_manager.vault import ProjectVault
 
 
 class StoreTests(unittest.TestCase):
@@ -277,6 +278,138 @@ class StoreTests(unittest.TestCase):
         recovered = self.store.recover()
         self.assertEqual(recovered["remaining_count"], 1)
         self.assertIn("recovery", recovered["active_tasks"][0]["description"])
+
+
+class ProjectVaultTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.vault = ProjectVault(Path(self.temp.name) / "vault")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_aliases_and_properties_are_saved_resolved_and_searchable(self):
+        note = self.vault.create_note(
+            "Account recovery",
+            "Use passkeys when available.",
+            ["security"],
+            ["Login recovery"],
+            {"status": "accepted", "reviewed": True, "priority": 2, "channels": ["email", "passkey"]},
+        )
+        self.assertEqual(self.vault.read_note("Login recovery")["id"], note["id"])
+        self.assertEqual(len(self.vault.search_notes("tag:#security [status:accepted]")), 1)
+        self.assertEqual(len(self.vault.search_notes("[reviewed:true] [priority:2]")), 1)
+        self.assertEqual(self.vault.search_notes("[status:draft]"), [])
+        self.assertIn("aliases:", (self.vault.root / note["path"]).read_text(encoding="utf-8"))
+
+    def test_null_properties_match_scalar_and_list_filters(self):
+        self.vault.create_note("Nullable fields", properties={"status": None, "choices": [None, "ready"]})
+        self.assertEqual(len(self.vault.search_notes("[status:null]")), 1)
+        self.assertEqual(len(self.vault.search_notes("[choices:null]")), 1)
+
+    def test_four_space_frontmatter_lists_support_tags_and_aliases(self):
+        self.vault.root.mkdir(parents=True)
+        (self.vault.root / "manual.md").write_text(
+            '---\ntitle: "Manual note"\ntags:\n    - research\naliases:\n    - Alternate name\nstatus: ready\n---\n\nBody.\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(self.vault.read_note("Alternate name")["title"], "Manual note")
+        self.assertEqual(len(self.vault.search_notes("tag:#research [status:ready]")), 1)
+
+    def test_json_frontmatter_and_nested_yaml_are_interpreted_safely(self):
+        self.vault.root.mkdir(parents=True)
+        (self.vault.root / "json.md").write_text(
+            '---\n{"title":"JSON note","tags":["json"],"aliases":["JSON alias"],"source":{"url":"https://example.com"}}\n---\n\nBody.\n',
+            encoding="utf-8",
+        )
+        (self.vault.root / "nested.md").write_text(
+            '---\ntitle: "Nested map"\nsource:\n  url: https://example.com\n---\n\nBody.\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(self.vault.read_note("JSON alias")["title"], "JSON note")
+        self.assertEqual(len(self.vault.search_notes("tag:#json")), 1)
+        self.assertEqual(self.vault.search_notes("[source:null]"), [])
+        self.assertEqual(self.vault.search_notes("[source]"), [])
+
+    def test_titles_and_aliases_with_link_syntax_characters_resolve(self):
+        note = self.vault.create_note("C# Setup", aliases=["C# Quickstart", "Title | Alias"])
+        self.assertEqual(self.vault.read_note("C# Setup")["id"], note["id"])
+        self.assertEqual(self.vault.read_note("C# Quickstart")["id"], note["id"])
+        self.assertEqual(self.vault.read_note("Title | Alias")["id"], note["id"])
+        self.vault.create_note("Link to hash title", "[[C# Setup]]")
+        self.assertEqual(self.vault.note_links("Link to hash title")[0]["resolved"]["id"], note["id"])
+
+    def test_markdown_links_resolve_outgoing_and_backlinks(self):
+        target = self.vault.create_note("Target note")
+        source_path = self.vault.root / "nested" / "Source.md"
+        source_path.parent.mkdir(parents=True)
+        source_path.write_text(
+            '---\ntitle: "Source note"\n---\n\nSee [the target][home].\n'
+            '[home]: ../target-note.md "Target note"\n'
+            'The target title is [another reference](../target-note.md (the target)).\n'
+            'The draft is [another](chapter (draft).md).\n',
+            encoding="utf-8",
+        )
+        draft_path = self.vault.root / "nested" / "chapter (draft).md"
+        draft_path.write_text('---\ntitle: "Draft chapter"\n---\n\nDraft.\n', encoding="utf-8")
+        outgoing = self.vault.note_links("Source note")
+        self.assertEqual(len(outgoing), 2)
+        target_link = next(item for item in outgoing if item["target"] == "../target-note.md")
+        draft_link = next(item for item in outgoing if item["target"] == "chapter (draft).md")
+        self.assertEqual(target_link["type"], "markdown")
+        self.assertEqual(target_link["resolved"]["id"], target["id"])
+        self.assertEqual(draft_link["resolved"]["title"], "Draft chapter")
+        self.assertEqual(self.vault.backlinks(target["id"])[0]["title"], "Source note")
+        self.assertEqual(self.vault.mentions(target["id"]), [])
+
+    def test_mentions_find_only_unlinked_prose_and_aliases(self):
+        target = self.vault.create_note("Curated knowledge", aliases=["Human knowledge"])
+        self.vault.create_note(
+            "References",
+            "Curated knowledge appears here. Human knowledge too. [[Curated knowledge]] "
+            "[Curated knowledge](curated-knowledge.md) `Human knowledge`\n\n"
+            "```md\nCurated knowledge\n```\n",
+        )
+        mentions = self.vault.mentions(target["id"])
+        self.assertEqual(len(mentions), 1)
+        self.assertEqual(mentions[0]["count"], 2)
+
+    def test_create_rejects_nested_properties(self):
+        with self.assertRaises(ValueError):
+            self.vault.create_note("Nested", properties={"source": {"url": "https://example.com"}})
+        with self.assertRaises(ValueError):
+            self.vault.create_note("Nested list", properties={"items": [["nested"]]})
+
+    def test_mcp_exposes_curated_note_operations(self):
+        from context_manager.mcp_server import TOOLS, main as mcp_main
+        create_schema = next(tool["inputSchema"] for tool in TOOLS if tool["name"] == "create_note")
+        property_schema = create_schema["properties"]["properties"]
+        array_schema = next(item for item in property_schema["additionalProperties"]["oneOf"] if item["type"] == "array")
+        self.assertNotIn("array", array_schema["items"]["type"])
+        self.assertEqual(property_schema["maxProperties"], 16)
+        self.assertIn("[iI][dD]", property_schema["propertyNames"]["pattern"])
+        requests = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25"}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "create_note", "arguments": {
+                "title": "Curated note", "aliases": ["Human note"], "tags": ["knowledge"],
+                "properties": {"status": "reviewed"}, "content": "A durable fact."}}},
+            {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "search_notes", "arguments": {
+                "query": "tag:#knowledge [status:reviewed]"}}},
+            {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "note_mentions", "arguments": {
+                "reference": "Human note"}}},
+        ]
+        output = io.StringIO()
+        with patch.dict(os.environ, {"CWM_PROJECT_ROOT": self.temp.name}), patch(
+            "sys.stdin", io.StringIO("".join(json.dumps(item) + "\n" for item in requests))
+        ), redirect_stdout(output):
+            mcp_main()
+        responses = [json.loads(line) for line in output.getvalue().splitlines()]
+        available_tools = {tool["name"] for tool in responses[1]["result"]["tools"]}
+        self.assertIn("note_mentions", available_tools)
+        matches = json.loads(responses[3]["result"]["content"][0]["text"])
+        self.assertEqual(matches[0]["title"], "Curated note")
+        self.assertEqual(json.loads(responses[4]["result"]["content"][0]["text"]), [])
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
 import re
 import time
 import unicodedata
@@ -18,8 +19,13 @@ from .store import scrub
 
 _FRONTMATTER = re.compile(r"\A---\r?\n(?P<header>.*?)\r?\n---(?:\r?\n|$)", re.S)
 _WIKILINK = re.compile(r"!?\[\[([^\]]+)\]\]")
+_REFERENCE_DEFINITION = re.compile(
+    r"(?m)^[ \t]{0,3}\[([^\]\n]+)\]:[ \t]*(?:<([^>\n]+)>|(\S+))"
+)
+_REFERENCE_LINK = re.compile(r"(?<!!)\[([^\]\n]+)\](?:\[([^\]\n]*)\])?")
 _TEMP_NOTE_WRITE = re.compile(r"^\..+\.md\.[0-9a-f]{32}\.tmp$")
 _LIST_ITEM = re.compile(r"( {0,3})([-+*]|\d{1,9}[.)])([ \t]+|$)")
+_PROPERTY_KEY = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_. -]{0,79}$")
 
 
 def _now() -> str:
@@ -45,45 +51,373 @@ def _unquote(value: str) -> str:
     return value
 
 
+def _split_inline_list(value: str) -> list[str]:
+    """Split a simple YAML inline list without splitting quoted commas."""
+    parts: list[str] = []
+    start = 0
+    quote: str | None = None
+    escaped = False
+    for index, char in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and quote == '"':
+            escaped = True
+            continue
+        if quote:
+            if char == quote:
+                quote = None
+        elif char in {'"', "'"}:
+            quote = char
+        elif char == ",":
+            parts.append(value[start:index].strip())
+            start = index + 1
+    parts.append(value[start:].strip())
+    return [part for part in parts if part]
+
+
+def _parse_frontmatter_value(value: str) -> Any:
+    value = value.strip()
+    if not value:
+        return None
+    if value.startswith("[") and value.endswith("]"):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+        return [_parse_frontmatter_value(part) for part in _split_inline_list(value[1:-1])]
+    if value.casefold() in {"null", "~"}:
+        return None
+    if value.casefold() in {"true", "false"}:
+        return value.casefold() == "true"
+    if re.fullmatch(r"[-+]?(?:0|[1-9]\d*)", value):
+        try:
+            return int(value)
+        except ValueError:
+            pass
+    if re.fullmatch(r"[-+]?(?:\d+\.\d*|\d*\.\d+)(?:[eE][-+]?\d+)?", value):
+        try:
+            return float(value)
+        except ValueError:
+            pass
+    return _unquote(value)
+
+
+def _property_value(properties: dict[str, Any], name: str, default: Any = None) -> Any:
+    folded = name.casefold()
+    return next((value for key, value in properties.items() if key.casefold() == folded), default)
+
+
+def _sanitize_property(value: Any) -> Any:
+    if isinstance(value, str):
+        return scrub(value)[:200]
+    if isinstance(value, list):
+        return [_sanitize_property(item) for item in value[:8]]
+    if isinstance(value, dict):
+        return {scrub(str(key))[:80]: _sanitize_property(item) for key, item in list(value.items())[:8]}
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return scrub(str(value))[:500]
+
+
+def _bounded_properties(properties: dict[str, Any]) -> dict[str, Any]:
+    return {
+        scrub(str(key))[:80]: _sanitize_property(value)
+        for key, value in list(properties.items())[:32]
+    }
+
+
 def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str, str | None]:
     match = _FRONTMATTER.match(text)
     if not match:
         return {}, text, None
 
     header = match.group("header")
+    stripped_header = header.strip()
+    if stripped_header.startswith("{") and stripped_header.endswith("}"):
+        try:
+            json_properties = json.loads(stripped_header)
+            if isinstance(json_properties, dict) and all(isinstance(key, str) for key in json_properties):
+                return json_properties, text[match.end():], header
+        except json.JSONDecodeError:
+            pass
+
     properties: dict[str, Any] = {}
-    tags: list[str] = []
-    reading_tags = False
+    list_key: str | None = None
     for line in header.splitlines():
-        item = re.match(r"^\s*-\s*(.*?)\s*$", line)
-        if item and reading_tags:
-            tag = _unquote(item.group(1))
-            if tag:
-                tags.append(tag)
+        if not line.strip():
             continue
-        reading_tags = False
-        key_value = re.match(r"^([A-Za-z0-9_-]+)\s*:\s*(.*?)\s*$", line)
+        item = re.match(r"^ {2,}-\s*(.*?)\s*$", line)
+        if item and list_key is not None:
+            if re.match(r"^[\w][\w .-]{0,79}\s*:\s*", item.group(1), flags=re.UNICODE):
+                properties.pop(list_key, None)
+                list_key = None
+                continue
+            current = properties.get(list_key)
+            if not isinstance(current, list):
+                current = []
+            current.append(_parse_frontmatter_value(item.group(1)))
+            properties[list_key] = current
+            continue
+        if line[:1].isspace():
+            if list_key is not None:
+                properties.pop(list_key, None)
+                list_key = None
+            continue
+        list_key = None
+        key_value = re.match(r"^([\w][\w .-]{0,79})\s*:\s*(.*?)\s*$", line, flags=re.UNICODE)
         if not key_value:
             continue
-        key, value = key_value.group(1).casefold(), key_value.group(2)
-        if key == "tags":
-            reading_tags = not value
-            if value.startswith("[") and value.endswith("]"):
-                try:
-                    parsed = json.loads(value)
-                    if isinstance(parsed, list):
-                        tags.extend(str(tag) for tag in parsed if str(tag).strip())
-                    else:
-                        tags.extend(part.strip().strip("\"'") for part in value[1:-1].split(",") if part.strip())
-                except json.JSONDecodeError:
-                    tags.extend(part.strip().strip("\"'") for part in value[1:-1].split(",") if part.strip())
-            elif value:
-                tags.append(_unquote(value))
-            properties["tags"] = tags
-        elif value:
-            properties[key] = _unquote(value)
+        key, value = key_value.group(1).strip(), key_value.group(2)
+        properties[key] = _parse_frontmatter_value(value)
+        if not value:
+            list_key = key
 
     return properties, text[match.end():], header
+
+
+def _frontmatter_scalar(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        return _quote(value)
+    raise ValueError("Frontmatter values must be strings, numbers, booleans, null, or flat lists")
+
+
+def _property_for_output(value: Any) -> Any:
+    if isinstance(value, list):
+        if any(isinstance(item, (dict, list)) for item in value):
+            raise ValueError("Property lists may contain only scalar values")
+        if len(value) > 32:
+            raise ValueError("Property lists may contain at most 32 values")
+        return [_parse_frontmatter_value(_frontmatter_scalar(item)) for item in value]
+    if isinstance(value, (dict, tuple, set)):
+        raise ValueError("Properties must be scalar values or flat lists")
+    return _parse_frontmatter_value(_frontmatter_scalar(value))
+
+
+def _property_matches(value: Any, wanted: str) -> bool:
+    folded = wanted.casefold()
+    if value is None:
+        return folded in {"null", "~"}
+    if isinstance(value, bool):
+        return ("true" if value else "false") == folded
+    return str(value).casefold() == folded
+
+
+def _searchable_property(value: Any) -> bool:
+    return not isinstance(value, dict) and not (
+        isinstance(value, list) and any(isinstance(item, (dict, list)) for item in value)
+    )
+
+
+def _yaml_property_lines(key: str, value: Any) -> list[str]:
+    if isinstance(value, list):
+        if not value:
+            return [f"{key}: []"]
+        return [f"{key}:", *(f"  - {_frontmatter_scalar(item)}" for item in value)]
+    return [f"{key}: {_frontmatter_scalar(value)}"]
+
+
+def _markdown_link_at(text: str, close_bracket: int) -> tuple[int, str] | None:
+    """Parse an inline Markdown destination, including balanced parentheses."""
+    if close_bracket + 1 >= len(text) or text[close_bracket + 1] != "(":
+        return None
+    index = close_bracket + 2
+    while index < len(text) and text[index].isspace():
+        index += 1
+    if index >= len(text):
+        return None
+
+    def is_escaped(position: int) -> bool:
+        slashes = 0
+        position -= 1
+        while position >= 0 and text[position] == "\\":
+            slashes += 1
+            position -= 1
+        return slashes % 2 == 1
+
+    if text[index] == "<":
+        start = index + 1
+        index = start
+        while index < len(text) and not (text[index] == ">" and not is_escaped(index)):
+            index += 1
+        if index >= len(text):
+            return None
+        destination = text[start:index].strip()
+        index += 1
+    else:
+        start = index
+        depth = 0
+        parenthetical_suffix: int | None = None
+        while index < len(text):
+            char = text[index]
+            if is_escaped(index):
+                index += 1
+                continue
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                if depth == 0:
+                    if parenthetical_suffix is not None:
+                        destination = text[start:parenthetical_suffix].strip()
+                        if destination:
+                            return index + 1, destination
+                    break
+                depth -= 1
+            elif char.isspace() and depth == 0:
+                # Treat a spaced parenthesized segment as part of the path
+                # (for example, ``chapter (draft).md``), a common human-authored
+                # filename even though quoting it with angle brackets is safer.
+                after_space = index
+                while after_space < len(text) and text[after_space].isspace():
+                    after_space += 1
+                if after_space >= len(text) or text[after_space] != "(":
+                    break
+                if parenthetical_suffix is None:
+                    parenthetical_suffix = index
+                index = after_space
+                continue
+            elif depth == 0 and parenthetical_suffix is not None and not char.isspace():
+                parenthetical_suffix = None
+            index += 1
+        destination = text[start:index].strip()
+    if not destination:
+        return None
+
+    while index < len(text) and text[index].isspace():
+        index += 1
+    if index < len(text) and text[index] == ")":
+        return index + 1, destination
+    if index >= len(text) or text[index] not in {'"', "'", "("}:
+        return None
+
+    title_opener = text[index]
+    if title_opener == "(":
+        depth = 1
+        index += 1
+        while index < len(text) and depth:
+            if not is_escaped(index):
+                if text[index] == "(":
+                    depth += 1
+                elif text[index] == ")":
+                    depth -= 1
+            index += 1
+        if depth:
+            return None
+    else:
+        index += 1
+        while index < len(text) and not (text[index] == title_opener and not is_escaped(index)):
+            index += 1
+        if index >= len(text):
+            return None
+        index += 1
+    while index < len(text) and text[index].isspace():
+        index += 1
+    if index >= len(text) or text[index] != ")":
+        return None
+    return index + 1, destination
+
+
+def _markdown_links(text: str) -> list[tuple[int, int, str]]:
+    """Return spans and destinations of inline Markdown links outside code."""
+    links: list[tuple[int, int, str]] = []
+    inline_spans: list[tuple[int, int]] = []
+    brackets: list[int] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "\\":
+            index += 2
+            continue
+        if char == "[":
+            brackets.append(index)
+        elif char == "]" and brackets:
+            opening = brackets.pop()
+            if opening > 0 and text[opening - 1] == "!":
+                index += 1
+                continue
+            parsed = _markdown_link_at(text, index)
+            if parsed:
+                end, destination = parsed
+                links.append((opening, end, destination))
+                inline_spans.append((opening, end))
+                index = end
+                continue
+        index += 1
+
+    definitions: dict[str, str] = {}
+    definition_spans: list[tuple[int, int]] = []
+    for match in _REFERENCE_DEFINITION.finditer(text):
+        label = " ".join(match.group(1).split()).casefold()
+        destination = match.group(2) or match.group(3) or ""
+        if label and destination:
+            definitions.setdefault(label, _markdown_unescape_target(destination))
+            line_start = text.rfind("\n", 0, match.start()) + 1
+            line_end = text.find("\n", match.end())
+            definition_spans.append((line_start, len(text) if line_end < 0 else line_end + 1))
+
+    excluded_spans = sorted([*inline_spans, *definition_spans])
+    excluded_index = 0
+
+    for match in _REFERENCE_LINK.finditer(text):
+        span = match.span()
+        while excluded_index < len(excluded_spans) and excluded_spans[excluded_index][1] <= span[0]:
+            excluded_index += 1
+        if excluded_index < len(excluded_spans) and excluded_spans[excluded_index][0] < span[1]:
+            continue
+        if span[0] > 0 and text[span[0] - 1] == "!":
+            continue
+        close = span[1]
+        if close < len(text) and text[close] in "(:":
+            continue
+        label = match.group(2) if match.group(2) else match.group(1)
+        key = " ".join(label.split()).casefold()
+        if key in definitions:
+            links.append((span[0], span[1], definitions[key]))
+    links.sort(key=lambda item: item[0])
+    return links
+
+
+def _reference_definition_spans(text: str) -> list[tuple[int, int]]:
+    spans = []
+    for match in _REFERENCE_DEFINITION.finditer(text):
+        line_start = text.rfind("\n", 0, match.start()) + 1
+        line_end = text.find("\n", match.end())
+        spans.append((line_start, len(text) if line_end < 0 else line_end + 1))
+    return spans
+
+
+def _markdown_unescape_target(value: str) -> str:
+    return re.sub(r"\\([^\w\s])", r"\1", value)
+
+
+def _extract_links(content: str) -> list[tuple[str, str]]:
+    visible = _link_text(content)
+    links = [("wikilink", match.group(1).strip()) for match in _WIKILINK.finditer(visible)]
+    for _, _, target in _markdown_links(visible):
+        if target and not re.match(r"(?i)^(?:[a-z][a-z0-9+.-]*:|//|#)", target):
+            links.append(("markdown", target))
+    return links
+
+
+def _unlinked_text(content: str) -> str:
+    """Mask code and explicit links while retaining ordinary prose for mentions."""
+    visible = _link_text(content)
+    mask = lambda match: "".join("\n" if char == "\n" else " " for char in match.group(0))
+    visible = _WIKILINK.sub(mask, visible)
+    spans = [(start, end) for start, end, _ in _markdown_links(visible)]
+    spans.extend(_reference_definition_spans(visible))
+    for start, end in sorted(spans, reverse=True):
+        replacement = "".join("\n" if char == "\n" else " " for char in visible[start:end])
+        visible = visible[:start] + replacement + visible[end:]
+    return visible
 
 
 def _strip_blockquotes(line: str) -> tuple[int, str]:
@@ -570,24 +904,31 @@ class ProjectVault:
         properties, body, _ = _parse_frontmatter(text)
         relative = path.relative_to(self.root).as_posix()
         first_heading = re.search(r"(?m)^#\s+(.+?)\s*#*\s*$", body)
-        title = scrub(str(properties.get("title") or (first_heading.group(1) if first_heading else path.stem))).strip()
-        tags = properties.get("tags", [])
+        title = scrub(str(_property_value(properties, "title") or (first_heading.group(1) if first_heading else path.stem))).strip()[:300]
+        tags = _property_value(properties, "tags", [])
         if not isinstance(tags, list):
             tags = [str(tags)] if tags else []
-        tags = [scrub(str(tag)).lstrip("#") for tag in tags if str(tag).strip()]
+        tags = [scrub(str(tag)).lstrip("#")[:100] for tag in tags if str(tag).strip()][:64]
+        aliases = _property_value(properties, "aliases", [])
+        if not isinstance(aliases, list):
+            aliases = [str(aliases)] if aliases else []
+        aliases = list(dict.fromkeys(
+            scrub(str(alias)).strip()[:300] for alias in aliases if scrub(str(alias)).strip()
+        ))[:32]
         safe_body = scrub(body)
-        links = [match.group(1).strip() for match in _WIKILINK.finditer(_link_text(safe_body))]
         try:
             modified = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat(timespec="seconds")
         except OSError:
             modified = ""
         return {
-            "id": scrub(str(properties.get("id") or Path(relative).with_suffix("").as_posix())),
+            "id": scrub(str(_property_value(properties, "id") or Path(relative).with_suffix("").as_posix())),
             "title": title,
             "path": relative,
             "tags": [str(tag).lstrip("#") for tag in tags if str(tag).strip()],
-            "created": scrub(str(properties.get("created") or "")),
-            "updated": scrub(str(properties.get("updated") or modified)),
+            "aliases": aliases,
+            "properties": _bounded_properties(properties),
+            "created": scrub(str(_property_value(properties, "created") or "")),
+            "updated": scrub(str(_property_value(properties, "updated") or modified)),
             "content": safe_body,
         }
 
@@ -626,7 +967,8 @@ class ProjectVault:
             no_suffix,
             Path(no_suffix).name,
             str(doc["title"]).casefold().strip(),
-        }
+            *(str(alias).casefold().strip() for alias in doc.get("aliases", [])),
+        } - {""}
 
     @staticmethod
     def _key_index(documents: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
@@ -639,7 +981,10 @@ class ProjectVault:
 
     @staticmethod
     def _reference_key(reference: str) -> str:
-        key = _link_target(reference)
+        key = unquote(reference.strip().replace("\\", "/"))
+        if key.casefold().endswith(".md"):
+            key = key[:-3]
+        key = key.casefold().strip(" /")
         if not key or key.startswith("."):
             raise ValueError("Note reference must be a note ID, title, or vault-relative path")
         return key
@@ -655,23 +1000,60 @@ class ProjectVault:
     @staticmethod
     def _resolve_from_index(reference: str, by_key: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
         key = ProjectVault._reference_key(reference)
-        return ProjectVault._resolve_candidates(reference, by_key.get(key, []))
+        matches = by_key.get(key, [])
+        if not matches:
+            matches = by_key.get(_link_target(reference), [])
+        return ProjectVault._resolve_candidates(reference, matches)
 
     @staticmethod
     def _resolve_from_documents(reference: str, documents: list[dict[str, Any]]) -> dict[str, Any]:
         key = ProjectVault._reference_key(reference)
         matches = [doc for doc in documents if key in ProjectVault._keys(doc)]
+        if not matches:
+            fallback = _link_target(reference)
+            matches = [doc for doc in documents if fallback in ProjectVault._keys(doc)]
         return ProjectVault._resolve_candidates(reference, matches)
 
     def _resolve(self, reference: str) -> dict[str, Any]:
         key = self._reference_key(reference)
         documents = self._documents()
         matches = [doc for doc in documents if key in self._keys(doc)]
+        if not matches:
+            fallback = _link_target(reference)
+            matches = [doc for doc in documents if fallback in self._keys(doc)]
         return self._resolve_candidates(reference, matches)
 
     @staticmethod
+    def _link_keys(raw: str, kind: str, source: dict[str, Any]) -> list[str]:
+        if kind == "markdown":
+            normalized = ProjectVault._markdown_reference(raw, source)
+            return [normalized] if normalized else []
+        keys: list[str] = []
+        try:
+            keys.append(ProjectVault._reference_key(raw))
+        except ValueError:
+            pass
+        fallback = _link_target(raw)
+        if fallback and fallback not in keys:
+            keys.append(fallback)
+        return keys
+
+    @staticmethod
     def _summary(doc: dict[str, Any]) -> dict[str, Any]:
-        return {key: doc[key] for key in ("id", "title", "path", "tags", "created", "updated")}
+        return {key: doc[key] for key in ("id", "title", "path", "tags", "aliases", "properties", "created", "updated")}
+
+    @staticmethod
+    def _markdown_reference(raw: str, source: dict[str, Any]) -> str | None:
+        target = _markdown_unescape_target(raw.split("#", 1)[0].split("?", 1)[0].strip()).replace("\\", "/")
+        target = unquote(target)
+        if not target or target.startswith("/"):
+            return None
+        normalized = posixpath.normpath(posixpath.join(posixpath.dirname(source["path"]), target))
+        if normalized == ".." or normalized.startswith("../"):
+            return None
+        if normalized.casefold().endswith(".md"):
+            normalized = normalized[:-3]
+        return normalized.casefold()
 
     def list_notes(self, tag: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         documents = self._documents()
@@ -688,7 +1070,7 @@ class ProjectVault:
         for doc in documents[:max(0, min(limit, 100))]:
             item = self._summary(doc)
             item["excerpt"] = _excerpt(doc["content"], set())
-            item["links"] = [link.strip() for link in _WIKILINK.findall(_link_text(doc["content"]))]
+            item["links"] = [target for _, target in _extract_links(doc["content"])]
             result.append(item)
         return result
 
@@ -699,26 +1081,56 @@ class ProjectVault:
         result["content"] = doc["content"][:char_limit]
         result["total_chars"] = len(doc["content"])
         result["truncated"] = len(doc["content"]) > char_limit
-        result["links"] = [link.strip() for link in _WIKILINK.findall(_link_text(doc["content"]))]
+        result["links"] = [target for _, target in _extract_links(doc["content"])]
         return result
 
     def search_notes(self, query: str, limit: int = 8) -> list[dict[str, Any]]:
-        terms = set(re.findall(r"[\w-]+", query.casefold()))
-        if not terms:
+        remaining = query
+        tag_filters = [match.group(1).lstrip("#").casefold() for match in
+                       re.finditer(r"(?<![\w])tag:(#?[\w/-]+)", remaining, flags=re.IGNORECASE)]
+        remaining = re.sub(r"(?<![\w])tag:#?[\w/-]+", " ", remaining, flags=re.IGNORECASE)
+        property_filters = [
+            (match.group(1).casefold().strip(), match.group(2).strip() if match.group(2) is not None else None)
+            for match in re.finditer(r"\[([\w][\w .-]{0,79})(?::([^\]]+))?\]", remaining, flags=re.UNICODE)
+        ]
+        remaining = re.sub(r"\[([\w][\w .-]{0,79})(?::([^\]]+))?\]", " ", remaining, flags=re.UNICODE)
+        terms = set(re.findall(r"[\w-]+", remaining.casefold()))
+        if not terms and not tag_filters and not property_filters:
             return []
         scored: list[tuple[int, dict[str, Any]]] = []
         for doc in self._documents():
+            if any(not any(value.casefold() == wanted for value in doc["tags"]) for wanted in tag_filters):
+                continue
+            property_index = {str(key).casefold(): value for key, value in doc["properties"].items()}
+            matched = True
+            for name, wanted in property_filters:
+                if name not in property_index or not _searchable_property(property_index[name]):
+                    matched = False
+                    break
+                if wanted is not None:
+                    value = property_index[name]
+                    values = value if isinstance(value, list) else [value]
+                    if not any(_property_matches(candidate, wanted) for candidate in values):
+                        matched = False
+                        break
+            if not matched:
+                continue
             title = doc["title"].casefold()
             tags = " ".join(doc["tags"]).casefold()
+            aliases = " ".join(doc["aliases"]).casefold()
+            properties = " ".join(
+                str(value) for value in doc["properties"].values() if _searchable_property(value)
+            ).casefold()
             content = doc["content"].casefold()
-            score = sum(5 for term in terms if term in title)
+            score = sum(5 for term in terms if term in title or term in aliases)
             score += sum(3 for term in terms if term in tags)
+            score += sum(2 for term in terms if term in properties)
             score += sum(1 for term in terms if term in content)
-            if score:
+            if score or tag_filters or property_filters:
                 item = self._summary(doc)
                 item["score"] = score
                 item["excerpt"] = _excerpt(doc["content"], terms)
-                item["links"] = [link.strip() for link in _WIKILINK.findall(_link_text(doc["content"]))]
+                item["links"] = [target for _, target in _extract_links(doc["content"])]
                 scored.append((score, item))
         scored.sort(key=lambda pair: (pair[0], pair[1]["updated"], pair[1]["title"].casefold()), reverse=True)
         return [item for _, item in scored[:max(0, min(limit, 100))]]
@@ -729,16 +1141,18 @@ class ProjectVault:
         doc = self._resolve_from_index(reference, by_key)
         result: list[dict[str, Any]] = []
         seen: set[str] = set()
-        for raw in _WIKILINK.findall(_link_text(doc["content"])):
-            target = raw.strip()
-            normalized = _link_target(target)
+        for kind, target in _extract_links(doc["content"]):
+            keys = self._link_keys(target, kind, doc)
+            if not keys:
+                continue
+            normalized = next((key for key in keys if by_key.get(key)), keys[0])
             candidates = by_key.get(normalized, [])
             resolved = candidates[0] if len(candidates) == 1 else None
             identity = resolved["id"] if resolved else normalized
             if identity in seen:
                 continue
             seen.add(identity)
-            result.append({"target": target, "resolved": self._summary(resolved) if resolved else None,
+            result.append({"target": target, "type": kind, "resolved": self._summary(resolved) if resolved else None,
                            "ambiguous": len(candidates) > 1})
         return result
 
@@ -750,27 +1164,92 @@ class ProjectVault:
         for source in documents:
             if source["id"] == target["id"]:
                 continue
-            for raw in _WIKILINK.findall(_link_text(source["content"])):
-                if _link_target(raw) in target_keys:
+            for kind, raw in _extract_links(source["content"]):
+                link_key = next((key for key in self._link_keys(raw, kind, source) if key in target_keys), None)
+                if link_key is not None:
                     item = self._summary(source)
-                    item["excerpt"] = _excerpt(source["content"], {_link_target(raw)})
+                    item["excerpt"] = _excerpt(source["content"], {link_key})
                     results.append(item)
                     break
         return results
 
-    def create_note(self, title: str, content: str = "", tags: list[str] | None = None) -> dict[str, Any]:
+    def mentions(self, reference: str) -> list[dict[str, Any]]:
+        """Find unlinked title or alias mentions in other notes."""
+        documents = self._documents()
+        target = self._resolve_from_documents(reference, documents)
+        labels = list(dict.fromkeys(
+            value for value in [target["title"], *target.get("aliases", [])]
+            if isinstance(value, str) and value.strip()
+        ))
+        if not labels:
+            return []
+        alternatives = "|".join(re.escape(label) for label in sorted(labels, key=len, reverse=True))
+        pattern = re.compile(rf"(?<!\w)({alternatives})(?!\w)", flags=re.IGNORECASE | re.UNICODE)
+        results = []
+        for source in documents:
+            if source["id"] == target["id"]:
+                continue
+            visible = _unlinked_text(source["content"])
+            matches = list(pattern.finditer(visible))
+            if matches:
+                first = matches[0].group(1)
+                item = self._summary(source)
+                item.update({"mention": first, "count": len(matches), "excerpt": _excerpt(visible, {first.casefold()})})
+                results.append(item)
+        return results
+
+    def create_note(
+        self,
+        title: str,
+        content: str = "",
+        tags: list[str] | None = None,
+        aliases: list[str] | None = None,
+        properties: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         safe_title = re.sub(r"\s+", " ", scrub(title).strip())
         if not safe_title:
             raise ValueError("Note title cannot be empty")
+        if len(safe_title) > 300:
+            raise ValueError("Note titles must be at most 300 characters")
         if tags is not None and (not isinstance(tags, list) or any(not isinstance(tag, str) for tag in tags)):
             raise ValueError("Tags must be a list of strings")
+        if aliases is not None and (not isinstance(aliases, list) or any(not isinstance(alias, str) for alias in aliases)):
+            raise ValueError("Aliases must be a list of strings")
+        if properties is not None and not isinstance(properties, dict):
+            raise ValueError("Properties must be an object")
         clean_tags: list[str] = []
         for tag in tags or []:
             value = scrub(str(tag)).strip().lstrip("#").casefold()
-            if not value or not re.fullmatch(r"[\w/-]+", value, flags=re.UNICODE):
+            if not value or len(value) > 100 or not re.fullmatch(r"[\w/-]+", value, flags=re.UNICODE):
                 raise ValueError(f"Invalid tag: {tag}")
             if value not in clean_tags:
                 clean_tags.append(value)
+        if len(clean_tags) > 64:
+            raise ValueError("At most 64 tags are supported on a note")
+        clean_aliases: list[str] = []
+        for alias in aliases or []:
+            value = re.sub(r"\s+", " ", scrub(alias).strip())
+            if len(value) > 300:
+                raise ValueError("Aliases must be at most 300 characters")
+            if value and value.casefold() not in {item.casefold() for item in clean_aliases}:
+                clean_aliases.append(value)
+        if len(clean_aliases) > 32:
+            raise ValueError("At most 32 aliases are supported on a note")
+        if len(properties or {}) > 16:
+            raise ValueError("At most 16 custom properties are supported on a note")
+        reserved = {"id", "title", "created", "updated", "tags", "aliases"}
+        clean_properties: dict[str, Any] = {}
+        for raw_key, raw_value in (properties or {}).items():
+            key = scrub(str(raw_key)).strip()
+            if not _PROPERTY_KEY.fullmatch(key) or key.casefold() in reserved:
+                raise ValueError(f"Invalid or reserved property name: {raw_key}")
+            if any(existing.casefold() == key.casefold() for existing in clean_properties):
+                raise ValueError(f"Duplicate property name: {key}")
+            if isinstance(raw_value, str):
+                raw_value = scrub(raw_value)
+            elif isinstance(raw_value, list):
+                raw_value = [scrub(item) if isinstance(item, str) else item for item in raw_value]
+            clean_properties[key] = _property_for_output(raw_value)
         if any(doc["title"].casefold() == safe_title.casefold() for doc in self._documents()):
             raise ValueError(f"A note titled '{safe_title}' already exists")
 
@@ -790,6 +1269,11 @@ class ProjectVault:
         if clean_tags:
             frontmatter.append("tags:")
             frontmatter.extend(f"  - {_quote(tag)}" for tag in clean_tags)
+        if clean_aliases:
+            frontmatter.append("aliases:")
+            frontmatter.extend(f"  - {_quote(alias)}" for alias in clean_aliases)
+        for key, value in clean_properties.items():
+            frontmatter.extend(_yaml_property_lines(key, value))
         frontmatter.append("---")
         body = scrub(content).strip()
         markdown = "\n".join(frontmatter) + f"\n\n# {safe_title}\n"
@@ -806,7 +1290,9 @@ class ProjectVault:
             path.unlink(missing_ok=True)
             raise
         return self._summary(self._document(path) or {"id": note_id, "title": safe_title, "path": path.name,
-                                                       "tags": clean_tags, "created": created, "updated": created})
+                                                       "tags": clean_tags, "aliases": clean_aliases,
+                                                       "properties": clean_properties,
+                                                       "created": created, "updated": created})
 
     def _replace_body(self, doc: dict[str, Any], body: str) -> None:
         path = self.root / doc["path"]
@@ -817,19 +1303,19 @@ class ProjectVault:
         updated = _quote(_now())
         if match:
             header = match.group("header")
-            if re.search(r"(?m)^updated\s*:", header):
-                header = re.sub(r"(?m)^updated\s*:\s*.*$", f"updated: {updated}", header, count=1)
+            if re.search(r"(?im)^updated\s*:", header):
+                header = re.sub(r"(?im)^(updated)\s*:\s*.*$", lambda item: f"{item.group(1)}: {updated}", header, count=1)
             else:
                 header += f"\nupdated: {updated}"
             replacement = f"---\n{header}\n---\n\n{body.rstrip()}\n"
         else:
             properties, _, _ = _parse_frontmatter(original)
-            created = str(properties.get("created") or _now())
-            tags = properties.get("tags", [])
+            created = str(_property_value(properties, "created") or _now())
+            tags = _property_value(properties, "tags", [])
             if not isinstance(tags, list):
                 tags = [str(tags)] if tags else []
-            header = ["---", f"id: {_quote(str(properties.get('id') or doc['id']))}",
-                      f"title: {_quote(str(properties.get('title') or doc['title']))}",
+            header = ["---", f"id: {_quote(str(_property_value(properties, 'id') or doc['id']))}",
+                      f"title: {_quote(str(_property_value(properties, 'title') or doc['title']))}",
                       f"created: {_quote(created)}", f"updated: {updated}"]
             if tags:
                 header.append("tags:")
@@ -869,12 +1355,11 @@ class ProjectVault:
         target_path = Path(target_doc["path"]).with_suffix("").as_posix()
         link = f"[[{target_path}]]"
         body = source_doc["content"]
-        for raw in _WIKILINK.findall(_link_text(body)):
-            try:
-                if self._resolve_from_index(raw, by_key)["id"] == target_doc["id"]:
+        for kind, raw in _extract_links(body):
+            for key in self._link_keys(raw, kind, source_doc):
+                candidates = by_key.get(key, [])
+                if len(candidates) == 1 and candidates[0]["id"] == target_doc["id"]:
                     return {"source": self._summary(source_doc), "target": self._summary(target_doc), "created": False}
-            except (KeyError, ValueError):
-                continue
         section = "## Related notes"
         if section.casefold() in body.casefold():
             offset = body.casefold().find(section.casefold()) + len(section)

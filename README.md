@@ -53,7 +53,7 @@ The automatic `sync` operation stores sanitized prompt clauses as candidate task
 
 Context Window Manager can keep durable project knowledge in a local Markdown vault at
 `.context-manager/vault/`. Notes are plain `.md` files with YAML frontmatter for an ID, title,
-timestamps, and optional tags. Existing notes are read from disk on each request, so edits made in Obsidian
+timestamps, tags, aliases, and custom scalar properties. Existing notes are read from disk on each request, so edits made in Obsidian
 or another Markdown editor are available without a separate import or index step. The SQLite
 database remains the source of truth for task state, dependencies, and checkpoints; vault notes
 hold supporting context, decisions, and project knowledge.
@@ -63,19 +63,25 @@ Create and connect notes with the CLI:
 ```sh
 cwm vault path
 cwm vault create "Login flow" --content "The login page is the authentication entry point."
-cwm vault create "Authentication decisions" --tag architecture --tag auth --content "Use [[Login flow]] as the entry point."
-cwm vault search "login"
+cwm vault create "Authentication decisions" --tag architecture --tag auth --alias "Auth decisions" --property status=accepted --property reviewed=true --content "Use [[Login flow]] as the entry point."
+cwm vault search 'tag:#architecture [status:accepted]'
 cwm vault links "Authentication decisions"
 cwm vault backlinks "Login flow"
+cwm vault mentions "Login flow"
 ```
 
 If the project is not already inside an Obsidian vault, open the printed directory with **Open folder
 as vault**. If it is inside an existing vault, keep this as a folder in that vault rather than opening
 a nested vault; Obsidian warns that links may not update correctly between nested vaults. Notes use
-Obsidian-compatible `[[wikilinks]]`; outgoing links and backlinks are resolved from Markdown as
-needed. `search_context` also includes a few relevant note excerpts when they fit the character
-budget, so recovered project context can include both active work and durable knowledge. The MCP
-server exposes note list, search, read, create, append, link, and backlink tools. Note writes and
+Obsidian-compatible `[[wikilinks]]` and standard internal Markdown links; outgoing links and backlinks
+are resolved from Markdown as needed. Aliases resolve as note references, and search accepts
+`tag:#tag`, `[property]`, and `[property:value]` filters. The `mentions` command finds title or alias
+references that are not already linked, so a human can decide whether to turn them into links. Note
+creation supports flat scalar properties and scalar lists; Obsidian remains the full editor for richer
+frontmatter. YAML and JSON top-level frontmatter fields are read; search indexes scalar and flat-list
+properties. Nested values are preserved on note edits but are not indexed. `search_context` also includes relevant note excerpts when they fit the character budget,
+so recovered project context can include both active work and durable knowledge. The MCP server exposes
+note list, search, read, create, append, link, backlink, and unlinked-mention tools. Note writes and
 content returned to the host pass through the common-credential scrubber. Notes remain local files;
 the server does not sync notes or call a remote service. A connected agent receives requested note
 content through MCP or hooks and applies its own data-handling policy.

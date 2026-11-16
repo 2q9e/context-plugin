@@ -69,14 +69,19 @@ def main(argv: list[str] | None = None) -> int:
     content_source.add_argument("--content", default="")
     content_source.add_argument("--content-file")
     vault_create.add_argument("--tag", action="append", default=[])
+    vault_create.add_argument("--alias", action="append", default=[])
+    vault_create.add_argument("--property", action="append", default=[], metavar="KEY=VALUE",
+                              help="Set a scalar or JSON scalar-list frontmatter property")
     vault_append = vault_subs.add_parser("append", help="Append Markdown to a note")
     vault_append.add_argument("reference"); vault_append.add_argument("content")
     vault_link = vault_subs.add_parser("link", help="Link two notes with an Obsidian wikilink")
     vault_link.add_argument("source"); vault_link.add_argument("target")
-    vault_links = vault_subs.add_parser("links", help="List a note's outgoing wikilinks")
+    vault_links = vault_subs.add_parser("links", help="List a note's outgoing internal links")
     vault_links.add_argument("reference")
     vault_backlinks = vault_subs.add_parser("backlinks", help="List notes that link to a note")
     vault_backlinks.add_argument("reference")
+    vault_mentions = vault_subs.add_parser("mentions", help="Find unlinked title or alias mentions")
+    vault_mentions.add_argument("reference")
     cleanup = subs.add_parser("cleanup", help="Expire old history and remove abandoned temporary files")
     cleanup.add_argument("--purge", action="store_true", help="Permanently remove all project state, including notes and tasks")
     cleanup.add_argument("--yes", action="store_true", help="Confirm --purge without an interactive prompt")
@@ -197,7 +202,17 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(project_vault.read_note(args.reference, args.chars), indent=2, ensure_ascii=False)); return 0
             if args.vault_action == "create":
                 content = Path(args.content_file).expanduser().read_text(encoding="utf-8") if args.content_file else args.content
-                print(json.dumps(project_vault.create_note(args.title, content, args.tag), indent=2, ensure_ascii=False)); return 0
+                properties = {}
+                for definition in args.property:
+                    key, separator, raw_value = definition.partition("=")
+                    if not separator or not key.strip():
+                        parser.error("--property must use KEY=VALUE")
+                    try:
+                        value = json.loads(raw_value)
+                    except json.JSONDecodeError:
+                        value = raw_value
+                    properties[key.strip()] = value
+                print(json.dumps(project_vault.create_note(args.title, content, args.tag, args.alias, properties), indent=2, ensure_ascii=False)); return 0
             if args.vault_action == "append":
                 print(json.dumps(project_vault.append_note(args.reference, args.content), indent=2, ensure_ascii=False)); return 0
             if args.vault_action == "link":
@@ -206,6 +221,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(project_vault.note_links(args.reference), indent=2, ensure_ascii=False)); return 0
             if args.vault_action == "backlinks":
                 print(json.dumps(project_vault.backlinks(args.reference), indent=2, ensure_ascii=False)); return 0
+            if args.vault_action == "mentions":
+                print(json.dumps(project_vault.mentions(args.reference), indent=2, ensure_ascii=False)); return 0
         if args.command == "add":
             task_id, created = store.add_task(args.description, priority=args.priority, acceptance=args.accept, parent_id=args.parent)
             print(json.dumps({"id": task_id, "created": created})); return 0

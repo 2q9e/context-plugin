@@ -98,7 +98,7 @@ For MCP, merge the `mcpServers` entry from [`integrations/claude/mcp.json`](inte
 
 Copy [`integrations/codex/hooks.json`](integrations/codex/hooks.json) to `.codex/hooks.json` in the project or `~/.codex/hooks.json`. Codex runs commands from the session working directory. UserPromptSubmit injects the active task bundle, SessionStart recovers it, and PreCompact checkpoints. Hook trust review may be required. Codex plugin-directory publication currently excludes lifecycle hooks, so use the project/user hooks configuration or a manually installed plugin. See [Codex hooks](https://developers.openai.com/codex/hooks) and [plugin packaging limits](https://developers.openai.com/plugins/guides/submit-claude-plugin).
 
-For MCP, merge [`integrations/codex/config.toml`](integrations/codex/config.toml) into the project's `.codex/config.toml` or `~/.codex/config.toml`. Keep hook and MCP settings in separate files if the Codex version warns about duplicate hook declarations.
+For MCP, merge [`integrations/codex/config.toml`](integrations/codex/config.toml) into the project's `.codex/config.toml` or `~/.codex/config.toml`. Codex loads project-level config only for trusted projects; use the user config when the project is not trusted ([Codex plugin configuration](https://developers.openai.com/plugins/build/plugins)). Keep hook and MCP settings in separate files if the Codex version warns about duplicate hook declarations.
 
 ### Cursor
 

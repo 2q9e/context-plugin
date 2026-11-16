@@ -387,7 +387,7 @@ class Store:
             if (local_path.is_absolute() or windows_path.is_absolute() or windows_path.drive or windows_path.root
                     or ".." in local_path.parts or ".." in windows_path.parts):
                 continue
-            safe_paths.append(path)
+            safe_paths.append(scrub(path))
         with self._write_transaction():
             row = self.db.execute("SELECT relevant_files FROM tasks WHERE id=?", (task_id,)).fetchone()
             if not row:

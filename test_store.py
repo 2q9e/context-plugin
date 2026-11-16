@@ -120,6 +120,17 @@ class StoreTests(unittest.TestCase):
         for value in (b"openai", b"private", b"value", b"db-private-value"):
             self.assertNotIn(value, raw)
 
+    def test_relevant_file_paths_are_redacted_before_persistence(self):
+        task_id, _ = self.store.add_task("Review service configuration")
+        secret = "supersecretvalue123456"
+        self.store.add_relevant_files(task_id, [f"config/API_KEY={secret}.env"])
+
+        task = self.store.list_tasks()[0]
+        self.assertEqual(json.loads(task["relevant_files"]), ["config/API_KEY=[REDACTED]"])
+        for database_file in (self.db, Path(f"{self.db}-wal")):
+            if database_file.exists():
+                self.assertNotIn(secret.encode(), database_file.read_bytes())
+
     def test_ambiguous_cancel_and_change_preserve_tasks(self):
         self.store.sync_requirements("Add email recovery. Add sms recovery.")
         before = {task["id"]: task["description"] for task in self.store.list_tasks()}

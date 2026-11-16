@@ -9,6 +9,7 @@ This checklist tracks the repository implementation against the assignment. Each
 - [x] Implement bounded lexical retrieval, session recovery, privacy retention controls, and dependency completion checks.
 - [x] Implement the CLI and MCP stdio server over the same project store.
 - [x] Add an Obsidian-compatible project notes vault with Markdown properties/tags, aliases, wikilinks and Markdown links, backlinks, unlinked mentions, property/tag search, and CLI/MCP access; installed-package smoke checks cover create/search/link/backlink flows.
+- [x] Add a loopback-only browser app for human note creation, search, reading, and editing alongside agent tasks and checkpoints; it uses the existing Markdown vault and SQLite store, with revision-aware, serialized note saves. Document `cwm ui` in the README.
 - [x] Extend human-curated knowledge support from Obsidian patterns: create and resolve aliases, read YAML/JSON frontmatter and variable-indentation flat lists, search scalar/flat-list properties, resolve Markdown inline/reference links, and review unlinked title/alias mentions. Add regression coverage for CLI/MCP-facing vault behavior.
 - [x] Add routine state cleanup for retention, abandoned note-write temp files, and SQLite compaction; add an explicitly confirmed full purge while preserving notes during routine cleanup. An installed-package smoke check verified stale-temp removal, compaction, preservation, purge, and symlink refusal.
 - [x] Add Claude Code, Codex, Cursor, and Freebuff integration examples with documented platform limits.

@@ -1,14 +1,17 @@
 """Obsidian-compatible, project-local Markdown notes for durable context."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import posixpath
 import re
+import stat
 import time
 import unicodedata
 import uuid
 from bisect import bisect_left, bisect_right
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -200,6 +203,53 @@ def _property_for_output(value: Any) -> Any:
     if isinstance(value, (dict, tuple, set)):
         raise ValueError("Properties must be scalar values or flat lists")
     return _parse_frontmatter_value(_frontmatter_scalar(value))
+
+
+@contextmanager
+def _exclusive_file_lock(path: Path):
+    """Serialize CWM note writers across processes using a persistent lock file."""
+    if path.is_symlink():
+        raise ValueError("Note write lock cannot be a symbolic link")
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
+    acquired = False
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError("Note write lock must be a regular file")
+        if os.name == "posix":
+            os.fchmod(descriptor, 0o600)
+        if os.name == "nt":
+            import msvcrt
+
+            if os.fstat(descriptor).st_size == 0:
+                os.write(descriptor, b"\0")
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            while True:
+                try:
+                    msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
+        else:
+            import fcntl
+
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            if os.name == "nt":
+                import msvcrt
+
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def _property_matches(value: Any, wanted: str) -> bool:
@@ -930,6 +980,7 @@ class ProjectVault:
             "created": scrub(str(_property_value(properties, "created") or "")),
             "updated": scrub(str(_property_value(properties, "updated") or modified)),
             "content": safe_body,
+            "revision": hashlib.sha256(text.encode("utf-8")).hexdigest(),
         }
 
     def _documents(self) -> list[dict[str, Any]]:
@@ -1079,6 +1130,7 @@ class ProjectVault:
         char_limit = max(256, min(char_limit, 100_000))
         result = self._summary(doc)
         result["content"] = doc["content"][:char_limit]
+        result["revision"] = doc["revision"]
         result["total_chars"] = len(doc["content"])
         result["truncated"] = len(doc["content"]) > char_limit
         result["links"] = [target for _, target in _extract_links(doc["content"])]
@@ -1294,11 +1346,19 @@ class ProjectVault:
                                                        "properties": clean_properties,
                                                        "created": created, "updated": created})
 
-    def _replace_body(self, doc: dict[str, Any], body: str) -> None:
+    def _replace_body(self, doc: dict[str, Any], body: str, expected_revision: str | None = None) -> None:
+        lock_key = hashlib.sha256(str(self._real_root).encode("utf-8")).hexdigest()[:24]
+        lock_path = self.root.parent / f".cwm-note-write-{lock_key}.lock"
+        with _exclusive_file_lock(lock_path):
+            self._replace_body_locked(doc, body, expected_revision)
+
+    def _replace_body_locked(self, doc: dict[str, Any], body: str, expected_revision: str | None = None) -> None:
         path = self.root / doc["path"]
         if path.is_symlink() or not path.resolve().is_relative_to(self._real_root):
             raise ValueError("Refusing to update a note outside the project vault")
         original = path.read_text(encoding="utf-8")
+        if expected_revision is not None and hashlib.sha256(original.encode("utf-8")).hexdigest() != expected_revision:
+            raise RuntimeError("Note changed since it was opened; reload before saving")
         match = _FRONTMATTER.match(original)
         updated_value = _now()
         updated = _quote(updated_value)
@@ -1317,7 +1377,7 @@ class ProjectVault:
                 header = re.sub(r"(?im)^(updated)\s*:\s*.*$", lambda item: f"{item.group(1)}: {updated}", header, count=1)
             else:
                 header += f"\nupdated: {updated}"
-            replacement = f"---\n{header}\n---\n\n{body.rstrip()}\n"
+            replacement = f"---\n{header}\n---\n{body.rstrip()}\n"
         else:
             properties, _, _ = _parse_frontmatter(original)
             created = str(_property_value(properties, "created") or _now())
@@ -1345,6 +1405,16 @@ class ProjectVault:
             os.replace(temp, path)
         finally:
             temp.unlink(missing_ok=True)
+
+    def replace_note_body(self, reference: str, content: str, expected_revision: str) -> dict[str, Any]:
+        """Replace a note body while preserving frontmatter and rejecting stale edits."""
+        if not isinstance(content, str) or len(content) > 100_000:
+            raise ValueError("Note content must be text no longer than 100,000 characters")
+        if not isinstance(expected_revision, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_revision):
+            raise ValueError("A valid note revision is required to save edits")
+        doc = self._resolve(reference)
+        self._replace_body(doc, scrub(content), expected_revision)
+        return self.read_note(doc["id"])
 
     def append_note(self, reference: str, content: str) -> dict[str, Any]:
         addition = scrub(content).strip()

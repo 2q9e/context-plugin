@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "context-window-manager"
 version = "0.1.0"
-description = "Local-first persistent requirements, tasks, and context recovery for coding agents"
+description = "Local-first project notes, task management, and recovery for people and coding agents"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"

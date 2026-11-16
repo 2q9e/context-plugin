@@ -43,6 +43,9 @@ def main(argv: list[str] | None = None) -> int:
     recover.add_argument("--budget", type=int, default=12)
     context = subs.add_parser("context", help="Retrieve tasks relevant to a query")
     context.add_argument("query"); context.add_argument("--limit", type=int, default=8); context.add_argument("--chars", type=int, default=6000)
+    ui = subs.add_parser("ui", help="Open the local notes and agent-memory app")
+    ui.add_argument("--port", type=int, default=8765, help="Loopback port; use 0 to select an available port")
+    ui.add_argument("--no-browser", action="store_true", help="Print the local URL without opening a browser")
     task = subs.add_parser("add", help="Add one task with optional acceptance criteria")
     task.add_argument("description"); task.add_argument("--priority", type=int, default=2); task.add_argument("--accept", action="append", default=[]); task.add_argument("--parent")
     deps = subs.add_parser(
@@ -196,6 +199,11 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(store.recover(args.budget), indent=2, ensure_ascii=False)); return 0
         if args.command == "context":
             print(json.dumps(store.context_bundle(args.query, args.chars), indent=2, ensure_ascii=False)); return 0
+        if args.command == "ui":
+            from .web_ui import serve
+            if not 0 <= args.port <= 65535:
+                parser.error("--port must be between 0 and 65535")
+            return serve(store, args.port, open_browser=not args.no_browser)
         if args.command == "vault":
             project_vault = ProjectVault(store.path.parent / "vault")
             if args.vault_action == "path":

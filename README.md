@@ -1,6 +1,6 @@
 # Context Window Manager
 
-A local-first task and recovery layer for coding agents. It keeps a per-project SQLite checklist, reconciles new prompt clauses without deleting prior work, records checkpoints, and exposes the same state through a CLI, host hooks, and MCP tools.
+A local-first notes, task, and recovery utility for people and coding agents. It keeps project knowledge in Markdown and a per-project SQLite checklist, reconciles new prompt clauses without deleting prior work, records checkpoints, and exposes the same state through a browser app, CLI, host hooks, and MCP tools.
 
 It cannot increase a model's physical context limit. The core uses a character-bounded, lexical retrieval bundle; automatic hooks capture prompt text, while semantic interpretation still depends on the model following the supplied workflow or calling the MCP tools.
 
@@ -10,6 +10,7 @@ It cannot increase a model's physical context limit. The core uses a character-b
 - Tasks with IDs, statuses, priority, parent, dependencies, acceptance criteria, relevant project files, decisions, verification evidence, and timestamps. A cancelled prerequisite no longer blocks dependent-task completion; its dependency link remains for history.
 - Prompt-clause capture with exact normalized deduplication, append-on-new-requirement behavior, explicit change/cancel reconciliation, and common credential redaction.
 - Session checkpoints and restart recovery, ranked lexical retrieval, and bounded context output.
+- A local browser app to create, search, read, and edit Markdown notes, follow links and backlinks, review project tasks, and save recovery checkpoints.
 - Completion requires a named evidence source and result, such as `test: python -m unittest passed`; evidence is recorded but not independently validated by the tool. Dependencies must be completed or cancelled first.
 - Dual-era MCP stdio server with modern protocol discovery and legacy initialization, plus examples for Claude Code, Codex, Cursor, and Freebuff.
 - Optional capture opt-out and history retention; active checklist tasks are retained.
@@ -46,7 +47,16 @@ cwm status TASK_ID completed --evidence "test: pytest tests/test_auth.py passed"
 cwm checkpoint "OAuth flow implemented" --last "Added callback handler" --next "Verify provider errors"
 cwm context "OAuth callback" --chars 4000
 cwm recover --budget 10
+cwm ui
 ```
+
+`cwm ui` opens the project notes and agent-memory app in your browser. It binds only to
+`127.0.0.1`; use `cwm ui --port 0` to choose an available port or `cwm ui --no-browser` to print
+the URL without opening it. The app edits the same Markdown files used by the CLI, MCP server,
+hooks, and Obsidian. It includes note search, a safe basic Markdown reading view, tagged note
+creation, property details, outgoing links and backlinks, task status controls, and checkpoint
+capture. Note body saves preserve frontmatter, warn when a note changed after it was opened,
+and serialize writes made through CWM. The app has no external runtime dependencies or remote service.
 
 Dependencies must be completed or cancelled before a dependent task can be completed. Cancelling a prerequisite releases dependent tasks without deleting the recorded dependency link. Run `cwm depends TASK_ID` with no dependency IDs to clear all dependency links from that task.
 
@@ -59,7 +69,9 @@ Context Window Manager can keep durable project knowledge in a local Markdown va
 timestamps, tags, aliases, and custom scalar properties. Existing notes are read from disk on each request, so edits made in Obsidian
 or another Markdown editor are available without a separate import or index step. The SQLite
 database remains the source of truth for task state, dependencies, and checkpoints; vault notes
-hold supporting context, decisions, and project knowledge.
+hold supporting context, decisions, and project knowledge. The `cwm ui` app provides a human
+workflow for those notes while agents continue to use the same notes and SQLite memory through
+CLI, hooks, or MCP.
 
 Create and connect notes with the CLI:
 
@@ -127,7 +139,7 @@ Run `cwm cleanup` to apply the configured history retention, remove abandoned no
 
 ## Architecture
 
-`context_manager/store.py` owns transactional SQLite persistence, requirement reconciliation, dependency validation, privacy filters, task context selection, and recovery. `context_manager/vault.py` reads and writes portable Markdown notes, metadata, and note links; the files are the notes' source of truth. `cli.py` implements direct use and host hook responses. `mcp_server.py` offers stdio tools over the same project state. Host configs remain thin and optional. The core uses lexical token-overlap scoring, not embeddings or a language model; `--chars` limits serialized context size, not true model tokens.
+`context_manager/store.py` owns transactional SQLite persistence, requirement reconciliation, dependency validation, privacy filters, task context selection, and recovery. `context_manager/vault.py` reads and writes portable Markdown notes, metadata, and note links; the files are the notes' source of truth. `context_manager/web_ui.py` serves the local human interface over the same vault and task store. `cli.py` implements direct use and host hook responses. `mcp_server.py` offers stdio tools over the same project state. Host configs remain thin and optional. The core uses lexical token-overlap scoring, not embeddings or a language model; `--chars` limits serialized context size, not true model tokens.
 
 See [`docs/REFERENCE_RESEARCH.md`](docs/REFERENCE_RESEARCH.md) for source-level reference notes and [`DEVELOPMENT_CHECKLIST.md`](DEVELOPMENT_CHECKLIST.md) for the implementation status.
 

@@ -1,6 +1,6 @@
 # Context Window Manager
 
-A local-first notes, task, and recovery utility for people and coding agents. It keeps project knowledge in Markdown and a per-project SQLite checklist, reconciles new prompt clauses without deleting prior work, records checkpoints, and exposes the same state through a browser app, CLI, host hooks, and MCP tools.
+Context Window Manager keeps project notes, tasks, decisions, and verification evidence available across coding sessions. It stores notes in Markdown and tasks in per-project SQLite, then exposes the same workspace through a local web UI, the CLI, host hooks, and MCP.
 
 It cannot increase a model's physical context limit. The core uses a character-bounded, lexical retrieval bundle; automatic hooks capture prompt text, while semantic interpretation still depends on the model following the supplied workflow or calling the MCP tools.
 
